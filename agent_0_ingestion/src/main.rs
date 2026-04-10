@@ -35,16 +35,20 @@ use tracing::{error, info, warn};
 
 // ── Tokocrypto combined stream URL (HFT branch) ───────────────────────────────
 //
-// btcusdt@depth@100ms   — 100 ms-batched differential LOB updates.
-//                         Feeds Engine D's DepthBook for micro-price / OBI.
+// Tokocrypto only provides @depth and @aggTrade streams for USDT pairs.
+// IDR pairs support @bookTicker only.
 //
-// btcusdt@aggTrade      — individual market order fills.
-//                         Provides TFI signal and fill-simulator price.
+// Engine D hybrid strategy (all formulas run in IDR):
+//   btcusdt@depth@100ms  — LOB volume structure for OBI.
+//                          BTC volumes are currency-agnostic (same physical orders).
+//   btcusdt@aggTrade     — BTC trade volumes for TFI (qty is in BTC, not USDT).
+//   btcidr@bookTicker    — IDR prices; drives Engine D tick on every ToB change.
+//                          Overrides the USDT prices from the depth stream so that
+//                          micro-price, reservation price, and spread are all in IDR.
 //
-// btcusdt@bookTicker    — best bid/ask for Engine B ratio signal.
-// ethusdt@bookTicker    — best bid/ask for Engine B ratio signal.
-// solidr@bookTicker     — SOL/IDR best bid/ask for Engine A.
-// btcidr@bookTicker     — BTC/IDR best bid/ask for Engine A + Engine C.
+// btcusdt@bookTicker    — Engine B ratio signal (USDT pair).
+// ethusdt@bookTicker    — Engine B ratio signal (USDT pair).
+// solidr@bookTicker     — SOL/IDR for Engine A.
 const TOKO_WSS_DEFAULT: &str = concat!(
     "wss://stream-cloud.tokocrypto.site/stream?streams=",
     "btcusdt@depth@100ms",
@@ -229,10 +233,16 @@ async fn stream_loop(
     // Engine D — instantiated outside the tick loop per PRD §4 (Prompt 4).
     let mut engine_d = HFTEngine::init();
 
-    // Last known aggTrade values; carried across depth-only ticks.
-    let mut last_trade_price: f64 = 0.0;
-    let mut last_trade_vol: f64   = 0.0;
+    // Last known aggTrade values (volumes in BTC — currency-agnostic).
+    // Price is NOT used from aggTrade; IDR prices come from btcidr@bookTicker.
+    let mut last_trade_vol: f64       = 0.0;
     let mut last_is_buyer_maker: bool = true;
+
+    // Last IDR prices from btcidr@bookTicker — the authoritative price source.
+    let mut last_idr_bid: f64     = 0.0;
+    let mut last_idr_ask: f64     = 0.0;
+    let mut last_idr_bid_vol: f64 = 0.0;
+    let mut last_idr_ask_vol: f64 = 0.0;
 
     // Telemetry: fire a Redis write every 1 s without blocking the tick loop.
     // tokio::spawn is intentionally here in the I/O loop — NOT inside tick().
@@ -264,9 +274,11 @@ async fn stream_loop(
 
         match combined.stream.as_str() {
 
-            // ── BTC/USDT 100 ms-batched depth diff (Engine D LOB) ────────────
-            // Apply the diff to the in-memory DepthBook, extract top-of-book,
-            // publish the LOB snapshot for Engine C, then call Engine D.tick().
+            // ── BTC/USDT 100 ms-batched depth (LOB volume structure) ────────
+            // Tokocrypto does not offer btcidr@depth. We use the USDT LOB for
+            // OBI volume ratios — BTC quantities are currency-agnostic.
+            // Prices from this stream are NOT passed to Engine D; IDR prices
+            // come exclusively from btcidr@bookTicker below.
             "btcusdt@depth@100ms" => {
                 let diff: DepthDiff = match serde_json::from_value(combined.data) {
                     Ok(d)  => d,
@@ -274,69 +286,71 @@ async fn stream_loop(
                 };
 
                 btcusdt_book.apply(&diff.bids, &diff.asks);
-                if !btcusdt_book.is_ready() { continue; }
 
-                let (bids, asks) = btcusdt_book.top(10);
-                if bids.is_empty() || asks.is_empty() { continue; }
-
-                // Periodic log: tick 1, then every 1 000 ticks.
                 if btcusdt_book.tick_count == 1 || btcusdt_book.tick_count % 1_000 == 0 {
-                    info!(
-                        "[EngineD] LOB tick #{} — best bid={:.0} IDR  ask={:.0} IDR",
-                        btcusdt_book.tick_count, bids[0].0, asks[0].0
-                    );
+                    let (bids, asks) = btcusdt_book.top(1);
+                    if !bids.is_empty() && !asks.is_empty() {
+                        info!(
+                            "[EngineD] LOB volume tick #{} — bid_vol={:.5} BTC  ask_vol={:.5} BTC  (IDR prices from bookTicker)",
+                            btcusdt_book.tick_count, bids[0].1, asks[0].1
+                        );
+                    }
                 }
 
-                // Publish LOB snapshot for Engine C.
-                let json = lob_json(&bids, &asks);
-                redis_set_and_publish(con, "toko:btc_usdt:lob", &json).await;
-
-                // ── Engine D tick (synchronous, zero-allocation) ──────────────
-                let now_ms = millis_now();
-                let _out = engine_d.tick(
-                    bids[0].0, bids[0].1,   // best_bid, bid_vol
-                    asks[0].0, asks[0].1,   // best_ask, ask_vol
-                    last_trade_price,
-                    last_trade_vol,
-                    last_is_buyer_maker,
-                    now_ms,
-                );
+                // Publish LOB for Engine C (USDT snapshot, unchanged from baseline).
+                if btcusdt_book.is_ready() {
+                    let (bids, asks) = btcusdt_book.top(10);
+                    if !bids.is_empty() && !asks.is_empty() {
+                        let json = lob_json(&bids, &asks);
+                        redis_set_and_publish(con, "toko:btc_usdt:lob", &json).await;
+                    }
+                }
+                // Engine D fires from btcidr@bookTicker, not here.
             }
 
-            // ── BTC/USDT aggTrade (Engine D TFI + fill simulator) ────────────
-            // Parse the market order, update last-trade cache, then immediately
-            // drive Engine D with the current top-of-book (if ready).
+            // ── BTC/USDT aggTrade (Engine D TFI volume signal) ──────────────
+            // aggTrade qty is in BTC — no currency conversion needed for TFI.
+            // is_buyer_maker determines the sign of each flow contribution.
+            // The USDT price is discarded; fill detection uses IDR bookTicker prices.
             "btcusdt@aggTrade" => {
                 let trade: AggTrade = match serde_json::from_value(combined.data) {
                     Ok(t)  => t,
                     Err(e) => { warn!("aggTrade parse error: {}", e); continue; }
                 };
 
-                let price = trade.price.parse::<f64>().unwrap_or(0.0);
-                let qty   = trade.qty.parse::<f64>().unwrap_or(0.0);
-                if price <= 0.0 || qty <= 0.0 { continue; }
+                let qty = trade.qty.parse::<f64>().unwrap_or(0.0);
+                if qty <= 0.0 { continue; }
 
-                last_trade_price    = price;
+                // Store volume and direction; price (USDT) deliberately ignored.
                 last_trade_vol      = qty;
                 last_is_buyer_maker = trade.is_buyer_maker;
 
-                // Fire Engine D immediately on every aggTrade if the book is ready.
-                if btcusdt_book.is_ready() {
-                    let (bids, asks) = btcusdt_book.top(1);
-                    if !bids.is_empty() && !asks.is_empty() {
-                        let now_ms = millis_now();
-                        let _out = engine_d.tick(
-                            bids[0].0, bids[0].1,
-                            asks[0].0, asks[0].1,
-                            price, qty,
-                            trade.is_buyer_maker,
-                            now_ms,
-                        );
-                    }
+                // Fire Engine D immediately with the latest IDR prices if available.
+                // Uses USDT LOB volumes for OBI — IDR prices from last bookTicker tick.
+                if last_idr_bid > 0.0 && last_idr_ask > 0.0 {
+                    let (bid_vol, ask_vol) = if btcusdt_book.is_ready() {
+                        let (bids, asks) = btcusdt_book.top(1);
+                        let bv = bids.first().map(|b| b.1).unwrap_or(last_idr_bid_vol);
+                        let av = asks.first().map(|a| a.1).unwrap_or(last_idr_ask_vol);
+                        (bv, av)
+                    } else {
+                        (last_idr_bid_vol, last_idr_ask_vol)
+                    };
+                    let now_ms = millis_now();
+                    // Pass IDR mid as the "trade price" for the fill simulator —
+                    // best approximation when no IDR aggTrade stream exists.
+                    let idr_mid = (last_idr_bid + last_idr_ask) * 0.5;
+                    let _out = engine_d.tick(
+                        last_idr_bid, bid_vol,
+                        last_idr_ask, ask_vol,
+                        idr_mid, qty,
+                        trade.is_buyer_maker,
+                        now_ms,
+                    );
                 }
             }
 
-            // ── BTC/USDT bookTicker ──────────────────────────────────────────
+            // ── BTC/USDT bookTicker (Engine B ratio signal only) ─────────────
             "btcusdt@bookTicker" => {
                 let bt = match parse_book_ticker(&combined.data) {
                     Some(b) => b,
@@ -345,19 +359,9 @@ async fn stream_loop(
                 let bid     = bt.bid_price.parse::<f64>().unwrap_or(0.0);
                 let ask     = bt.ask_price.parse::<f64>().unwrap_or(0.0);
                 let bid_qty = bt.bid_qty.parse::<f64>().unwrap_or(0.0);
-                let ask_qty = bt.ask_qty.parse::<f64>().unwrap_or(0.0);
                 if bid <= 0.0 || ask <= 0.0 { continue; }
-
+                // Engine B only — USDT pair not used by Engine D.
                 redis_set(con, "toko:btc_usdt:ticker", &ticker_json(ask, bid, bid_qty)).await;
-
-                // Override top-of-book in the LOB snapshot with the freshest values.
-                if btcusdt_book.is_ready() {
-                    let (mut bids, mut asks) = btcusdt_book.top(10);
-                    if !bids.is_empty() { bids[0] = (bid, bid_qty); }
-                    if !asks.is_empty() { asks[0] = (ask, ask_qty); }
-                    let json = lob_json(&bids, &asks);
-                    redis_set_and_publish(con, "toko:btc_usdt:lob", &json).await;
-                }
             }
 
             // ── ETH/USDT bookTicker (Engine B ratio signal) ──────────────────
@@ -386,7 +390,14 @@ async fn stream_loop(
                 redis_set(con, "toko:sol_idr:ticker", &ticker_json(ask, bid, ask_qty * ask)).await;
             }
 
-            // ── BTC/IDR bookTicker (Engine A spread + Engine C execution) ────
+            // ── BTC/IDR bookTicker — primary Engine D price feed ────────────
+            // This is the ONLY source of IDR prices on Tokocrypto.
+            // Fires on every top-of-book change; we use it as the heartbeat
+            // that drives all price-sensitive Engine D formulas:
+            //   • Micro-Price  (IDR bid/ask prices + USDT LOB volumes for OBI)
+            //   • Reservation Price (IDR)
+            //   • Optimal Spread   (IDR)
+            //   • Fill Simulator   (IDR mid as proxy trade price)
             "btcidr@bookTicker" => {
                 let bt = match parse_book_ticker(&combined.data) {
                     Some(b) => b,
@@ -394,9 +405,48 @@ async fn stream_loop(
                 };
                 let bid     = bt.bid_price.parse::<f64>().unwrap_or(0.0);
                 let ask     = bt.ask_price.parse::<f64>().unwrap_or(0.0);
+                let bid_qty = bt.bid_qty.parse::<f64>().unwrap_or(0.0);
                 let ask_qty = bt.ask_qty.parse::<f64>().unwrap_or(0.0);
                 if bid <= 0.0 || ask <= 0.0 { continue; }
+
+                // Cache IDR prices for use in aggTrade handler.
+                last_idr_bid     = bid;
+                last_idr_ask     = ask;
+                last_idr_bid_vol = bid_qty;
+                last_idr_ask_vol = ask_qty;
+
+                // Publish ticker for Engine A / C consumers.
                 redis_set(con, "toko:btc_idr:ticker", &ticker_json(ask, bid, ask_qty * ask)).await;
+
+                // Blend: use IDR prices as the top-of-book, USDT LOB for depth levels 2-10.
+                // This gives the best available IDR LOB approximation.
+                let (bid_vol, ask_vol) = if btcusdt_book.is_ready() {
+                    let (mut lob_bids, mut lob_asks) = btcusdt_book.top(10);
+                    if !lob_bids.is_empty() { lob_bids[0] = (bid, bid_qty); }
+                    if !lob_asks.is_empty() { lob_asks[0] = (ask, ask_qty); }
+                    let json = lob_json(&lob_bids, &lob_asks);
+                    redis_set_and_publish(con, "toko:btc_idr:lob", &json).await;
+                    (
+                        lob_bids.first().map(|b| b.1).unwrap_or(bid_qty),
+                        lob_asks.first().map(|a| a.1).unwrap_or(ask_qty),
+                    )
+                } else {
+                    (bid_qty, ask_qty)
+                };
+
+                // ── Engine D tick — all values in IDR ─────────────────────────
+                // IDR mid as fill-simulator trade price: best proxy when
+                // btcidr@aggTrade is unavailable on this exchange.
+                let idr_mid = (bid + ask) * 0.5;
+                let now_ms  = millis_now();
+                let _out = engine_d.tick(
+                    bid, bid_vol,           // best_bid_idr, bid_vol (BTC)
+                    ask, ask_vol,           // best_ask_idr, ask_vol (BTC)
+                    idr_mid,               // latest_trade_price_idr (mid proxy)
+                    last_trade_vol,        // latest_trade_vol (BTC, from aggTrade)
+                    last_is_buyer_maker,
+                    now_ms,
+                );
             }
 
             other => { warn!("Unhandled stream: {}", other); }

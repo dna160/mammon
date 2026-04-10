@@ -81,7 +81,11 @@ services:
       INDO_API_SECRET:  ${INDO_API_SECRET}
       # Indodax WebSocket JWT — sourced from .env, never hardcoded in source.
       INDO_WS_TOKEN:    ${INDO_WS_TOKEN}
-      # HFT stream URL: 100ms-batched depth + aggTrade for Engine D
+      # HFT streams for Engine D:
+      #   btcusdt@depth@100ms — LOB volume structure (BTC qty, currency-agnostic)
+      #   btcusdt@aggTrade    — trade flow volumes for TFI (BTC qty, currency-agnostic)
+      #   btcidr@bookTicker   — authoritative IDR prices; drives Engine D tick
+      # Tokocrypto does not expose btcidr@depth or btcidr@aggTrade streams.
       TOKO_STREAM_URL: "wss://stream-cloud.tokocrypto.site/stream?streams=btcusdt@depth@100ms/btcusdt@aggTrade/btcusdt@bookTicker/ethusdt@bookTicker/solidr@bookTicker/btcidr@bookTicker"
       RUST_LOG: info
     depends_on:
