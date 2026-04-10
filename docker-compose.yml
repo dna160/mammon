@@ -1,0 +1,119 @@
+version: "3.9"
+
+networks:
+  mammon_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+  redis:
+    image: redis:7-alpine
+    networks: [mammon_net]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mammon}
+      POSTGRES_USER: ${POSTGRES_USER:-mammon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mammon}
+    networks: [mammon_net]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database_schema/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mammon} -d ${POSTGRES_DB:-mammon}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  agent_0:
+    build: ./agent_0_ingestion
+    networks: [mammon_net]
+    environment:
+      REDIS_URL: redis://redis:6379
+      TOKO_API_KEY: ${TOKO_API_KEY}
+      TOKO_API_SECRET: ${TOKO_API_SECRET}
+      INDO_API_KEY: ${INDO_API_KEY}
+      INDO_API_SECRET: ${INDO_API_SECRET}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent_a:
+    build: ./agent_A_spatial
+    networks: [mammon_net]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DB_DSN: postgresql://${POSTGRES_USER:-mammon}:${POSTGRES_PASSWORD:-mammon}@postgres:5432/${POSTGRES_DB:-mammon}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent_b:
+    build: ./agent_B_statistical
+    networks: [mammon_net]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DB_DSN: postgresql://${POSTGRES_USER:-mammon}:${POSTGRES_PASSWORD:-mammon}@postgres:5432/${POSTGRES_DB:-mammon}
+      PYTHONUNBUFFERED: "1"
+      TOKO_API_KEY: ${TOKO_API_KEY}
+      TOKO_API_SECRET: ${TOKO_API_SECRET}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent_c:
+    build: ./agent_C_microstructure
+    networks: [mammon_net]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DB_DSN: postgresql://${POSTGRES_USER:-mammon}:${POSTGRES_PASSWORD:-mammon}@postgres:5432/${POSTGRES_DB:-mammon}
+      PYTHONUNBUFFERED: "1"
+      TOKO_API_KEY: ${TOKO_API_KEY}
+      TOKO_API_SECRET: ${TOKO_API_SECRET}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard_backend:
+    build: ./agent_dashboard/backend
+    networks: [mammon_net]
+    ports:
+      - "4000:4000"
+    environment:
+      DB_DSN: postgresql://${POSTGRES_USER:-mammon}:${POSTGRES_PASSWORD:-mammon}@postgres:5432/${POSTGRES_DB:-mammon}
+      PORT: "4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard_frontend:
+    build: ./agent_dashboard/frontend
+    networks: [mammon_net]
+    ports:
+      - "3000:80"
+    depends_on:
+      - dashboard_backend
+    restart: unless-stopped
