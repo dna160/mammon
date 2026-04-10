@@ -84,13 +84,14 @@ app.get('/api/trades', async (_req, res) => {
         timestamp,
         engine_id,
         asset_pair,
-        trade_size_usdt_idr,
+        trade_size_idr,
         entry_signal_value,
         gross_pnl,
         fees_paid,
         net_pnl,
         trade_roe_pct
       FROM trade_telemetry
+      WHERE asset_pair = 'BTC_IDR'
       ORDER BY timestamp DESC
       LIMIT 50
     `);
