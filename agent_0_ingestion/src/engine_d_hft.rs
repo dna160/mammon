@@ -38,10 +38,6 @@ const TFI_CAP: usize = 512;
 /// Rolling TFI window length in milliseconds.
 const TFI_WINDOW_MS: u64 = 1_000;
 
-/// Notional IDR value per simulated fill (one BTC lot in IDR terms).
-/// Fill simulator adds/subtracts this scaled by trade quantity.
-const IDR_PER_BTC: f64 = 1.0; // multiplied by trade_price * trade_vol at fill
-
 // ── Fill side ─────────────────────────────────────────────────────────────────
 
 /// Which side of the book was filled this tick.
@@ -83,6 +79,10 @@ pub struct TickOutput {
     pub total_trades: u64,
     /// Fill recorded on this specific tick, if any.
     pub fill_this_tick: Option<FillSide>,
+    /// Current EWMA σ² (IDR²) — exposed for logging/telemetry.
+    pub variance: f64,
+    /// Number of IDR price ticks seen so far (for warm-up tracking).
+    pub warm_ticks: u64,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -112,6 +112,10 @@ pub struct HFTEngine {
     /// Total simulated fills (both sides combined).
     pub total_trades: u64,
 
+    /// Number of IDR bookTicker ticks processed (used for EWMA warm-up guard).
+    /// Skew logic and fill simulation are suppressed until warm_ticks ≥ 20.
+    pub warm_ticks: u64,
+
     // ── TFI ring buffer (zero-allocation) ────────────────────────────────────
     /// Trade volumes stored in insertion order (ring buffer).
     tfi_vols: [f64; TFI_CAP],
@@ -130,6 +134,25 @@ pub struct HFTEngine {
 }
 
 impl HFTEngine {
+    /// Apply a confirmed exchange fill to inventory and PnL.
+    /// Called by the order manager when Tokocrypto's trade history returns a
+    /// new fill for one of our live orders.  Never called from tick().
+    ///
+    /// `is_buy` — true = we bought BTC (our bid was hit), false = we sold BTC.
+    /// `price`  — actual execution price in IDR.
+    /// `qty`    — executed quantity in BTC.
+    pub fn record_real_fill(&mut self, is_buy: bool, price: f64, qty: f64) {
+        let notional = price * qty;
+        if is_buy {
+            self.inventory_btc += qty;
+            self.pnl_idr       -= notional; // IDR spent buying BTC
+        } else {
+            self.inventory_btc -= qty;
+            self.pnl_idr       += notional; // IDR received selling BTC
+        }
+        self.total_trades += 1;
+    }
+
     /// Return a fully zeroed instance ready for the first tick.
     pub fn init() -> Self {
         Self {
@@ -140,6 +163,7 @@ impl HFTEngine {
             open_ask: None,
             pnl_idr: 0.0,
             total_trades: 0,
+            warm_ticks: 0,
             tfi_vols: [0.0; TFI_CAP],
             tfi_ts:   [0;   TFI_CAP],
             tfi_sign: [0;   TFI_CAP],
@@ -195,9 +219,32 @@ impl HFTEngine {
         // ── Formula 4: EWMA High-Frequency Variance ───────────────────────────
         // ΔP = P_micro_t − P_micro_{t−1}
         // σ²_t = (1−α)·σ²_{t−1} + α·(ΔP)²     α = 0.01
+        //
+        // Warm-up note: btcidr@bookTicker fires ~1 Hz.  At that rate ΔP between
+        // consecutive ticks can be ~100–200 K IDR (intraday drift), driving σ²
+        // toward (ΔP)² ≈ 36 B IDR² at steady state.  We use two guards:
+        //   1. warm_ticks counter — gates skew/fill logic until EWMA has stabilised.
+        //   2. Variance cap at (0.05% of micro_price)² — hard upper bound so
+        //      spread_delta never leaves tradeable territory even before warm-up.
         if self.last_micro_price > 0.0 {
             let delta_p = micro_price - self.last_micro_price;
             self.variance = (1.0 - ALPHA) * self.variance + ALPHA * delta_p * delta_p;
+            // Cap σ² so that γ·σ² ≤ 0.05 % of micro_price.
+            // This bounds BOTH the spread half-width AND the inventory skew term
+            // (q · γ · σ²) so that reservation_price and optimal_bid/ask remain
+            // positive regardless of how large ΔP ticks become (e.g. from the
+            // ~1 Hz btcidr@bookTicker stream where ΔP can be ~200 K IDR).
+            //
+            // max_spread_half = 0.05 % of price
+            // max σ² = max_spread_half / GAMMA   (so γ · σ² = max_spread_half)
+            //
+            // At 1.228 B IDR: max σ² ≈ 1.228 M IDR²  →  δ_max ≈ 614 K IDR (0.05 %)
+            // For q = 1 BTC:  q · γ · σ² ≤ 614 K IDR  →  |r − P_micro| ≤ 0.05 %
+            let max_variance = (micro_price * 5e-4) / GAMMA;
+            if self.variance > max_variance {
+                self.variance = max_variance;
+            }
+            self.warm_ticks += 1;
         }
         self.last_micro_price = micro_price;
 
@@ -242,20 +289,29 @@ impl HFTEngine {
         // ── Formula 6: Optimal Spread & Quote Placement ───────────────────────
         // δ = Tick_Size_IDR + (γ · σ²)
         // P*_bid = r − δ      P*_ask = r + δ
-        let spread_delta = TICK_SIZE_IDR + (GAMMA * self.variance);
+        //
+        // Clamp δ to at most 0.05 % of micro_price so that even a cold EWMA
+        // (or one large-ΔP tick at start-up) cannot push optimal_bid negative.
+        let raw_delta   = TICK_SIZE_IDR + (GAMMA * self.variance);
+        let max_delta   = micro_price * 5e-4; // 0.05 % of current price
+        let spread_delta = raw_delta.min(max_delta).max(TICK_SIZE_IDR);
         let optimal_bid  = reservation_price - spread_delta;
         let optimal_ask  = reservation_price + spread_delta;
 
         // ── State 2: Execution Skew — Alpha Overlay ───────────────────────────
+        // Suppressed during EWMA warm-up (first 20 IDR ticks) so that a cold
+        // variance estimate cannot produce nonsensical skew decisions.
+        //
         // OBI > +0.8 AND TFI > 0  → massive buy pressure:
         //   cancel ask (don't get run over), ride bid at best bid.
         // OBI < −0.8 AND TFI < 0  → massive sell pressure:
         //   cancel bid, place ask at best ask.
         // Otherwise: symmetric AS quotes.
-        if obi > OBI_SKEW_THRESHOLD && tfi > 0.0 {
+        let warmed_up = self.warm_ticks >= 20;
+        if warmed_up && obi > OBI_SKEW_THRESHOLD && tfi > 0.0 {
             self.open_ask = None;
             self.open_bid = Some(best_bid);
-        } else if obi < -OBI_SKEW_THRESHOLD && tfi < 0.0 {
+        } else if warmed_up && obi < -OBI_SKEW_THRESHOLD && tfi < 0.0 {
             self.open_bid = None;
             self.open_ask = Some(best_ask);
         } else {
@@ -263,39 +319,13 @@ impl HFTEngine {
             self.open_ask = Some(optimal_ask);
         }
 
-        // ── State 3: Simulated Fill Engine ────────────────────────────────────
-        // Check the incoming aggTrade price against our simulated open orders.
-        // If a market sell hits our bid  → FILL (Buy):  inventory increases.
-        // If a market buy  hits our ask  → FILL (Sell): inventory decreases.
-        // PnL is tracked in IDR (price × qty).
-        let mut fill_this_tick: Option<FillSide> = None;
-
-        if latest_trade_price > 0.0 && latest_trade_vol > 0.0 {
-            let notional_idr = latest_trade_price * latest_trade_vol * IDR_PER_BTC;
-
-            if let Some(ob) = self.open_bid {
-                if latest_trade_price <= ob {
-                    // Aggressive seller hit our passive bid — we bought BTC.
-                    self.inventory_btc += latest_trade_vol;
-                    self.pnl_idr       -= notional_idr; // spent IDR
-                    self.total_trades  += 1;
-                    fill_this_tick      = Some(FillSide::Buy);
-                }
-            }
-            // Check ask fill only if bid was not hit this same trade
-            // (one aggTrade cannot simultaneously hit both sides).
-            if fill_this_tick.is_none() {
-                if let Some(oa) = self.open_ask {
-                    if latest_trade_price >= oa {
-                        // Aggressive buyer hit our passive ask — we sold BTC.
-                        self.inventory_btc -= latest_trade_vol;
-                        self.pnl_idr       += notional_idr; // received IDR
-                        self.total_trades  += 1;
-                        fill_this_tick      = Some(FillSide::Sell);
-                    }
-                }
-            }
-        }
+        // ── State 3: Real Fill Tracking ───────────────────────────────────────
+        // Simulated fill engine removed.  inventory_btc, pnl_idr, and
+        // total_trades are now driven exclusively by confirmed Tokocrypto fills
+        // polled by the order manager task via record_real_fill() below.
+        // The tick() path no longer mutates those fields, so there are no
+        // phantom "fills" from market aggTrades that were never real orders.
+        let fill_this_tick: Option<FillSide> = None;
 
         TickOutput {
             micro_price,
@@ -310,6 +340,8 @@ impl HFTEngine {
             pnl_idr: self.pnl_idr,
             total_trades: self.total_trades,
             fill_this_tick,
+            variance: self.variance,
+            warm_ticks: self.warm_ticks,
         }
     }
 }
