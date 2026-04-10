@@ -1,0 +1,102 @@
+# docker-compose.hft.yml — Engine D (HFT) isolated stack
+#
+# Run with:  docker compose -f docker-compose.hft.yml up --build
+#
+# Uses separate named volumes, network, and port offsets (+1 on frontend/backend,
+# +1 on postgres, +1 on redis) so it can run side-by-side with the main stack
+# without port conflicts.
+#
+# Agents A / B / C are intentionally excluded — this stack is Engine D only.
+
+version: "3.9"
+
+networks:
+  mammon_hft_net:
+    driver: bridge
+
+volumes:
+  redis_hft_data:
+  postgres_hft_data:
+
+services:
+
+  # ── Shared infrastructure ───────────────────────────────────────────────────
+
+  redis_hft:
+    image: redis:7-alpine
+    container_name: mammon_redis_hft
+    networks: [mammon_hft_net]
+    ports:
+      - "6380:6379"          # avoids conflict with main stack's 6379
+    volumes:
+      - redis_hft_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres_hft:
+    image: timescale/timescaledb:latest-pg15
+    container_name: mammon_postgres_hft
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-mammon}
+      POSTGRES_USER:     ${POSTGRES_USER:-mammon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mammon}
+    networks: [mammon_hft_net]
+    ports:
+      - "5433:5432"          # avoids conflict with main stack's 5432
+    volumes:
+      - postgres_hft_data:/var/lib/postgresql/data
+      - ./database_schema/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mammon} -d ${POSTGRES_DB:-mammon}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── Engine D — Rust HFT ingestion binary ────────────────────────────────────
+
+  agent_0_hft:
+    build: ./agent_0_ingestion
+    container_name: mammon_agent0_hft
+    networks: [mammon_hft_net]
+    environment:
+      REDIS_URL:        redis://redis_hft:6379
+      TOKO_API_KEY:     ${TOKO_API_KEY}
+      TOKO_API_SECRET:  ${TOKO_API_SECRET}
+      INDO_API_KEY:     ${INDO_API_KEY}
+      INDO_API_SECRET:  ${INDO_API_SECRET}
+      # HFT stream URL: 100ms-batched depth + aggTrade for Engine D
+      TOKO_STREAM_URL: "wss://stream-cloud.tokocrypto.site/stream?streams=btcusdt@depth@100ms/btcusdt@aggTrade/btcusdt@bookTicker/ethusdt@bookTicker/solidr@bookTicker/btcidr@bookTicker"
+      RUST_LOG: info
+    depends_on:
+      redis_hft:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Dashboard (Engine D telemetry) ──────────────────────────────────────────
+
+  dashboard_backend_hft:
+    build: ./agent_dashboard/backend
+    container_name: mammon_backend_hft
+    networks: [mammon_hft_net]
+    ports:
+      - "4001:4000"          # avoids conflict with main stack's 4000
+    environment:
+      DB_DSN: postgresql://${POSTGRES_USER:-mammon}:${POSTGRES_PASSWORD:-mammon}@postgres_hft:5432/${POSTGRES_DB:-mammon}
+      PORT: "4000"
+    depends_on:
+      postgres_hft:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard_frontend_hft:
+    build: ./agent_dashboard/frontend
+    container_name: mammon_frontend_hft
+    networks: [mammon_hft_net]
+    ports:
+      - "3001:80"            # avoids conflict with main stack's 3000
+    depends_on:
+      - dashboard_backend_hft
+    restart: unless-stopped

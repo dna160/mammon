@@ -1,47 +1,54 @@
 //! Agent 0: Live Price Feed — Tokocrypto + Indodax WebSocket Multiplexer
 //!
 //! Architecture:
-//!   Tokocrypto `btcusdt@depth` — real-time differential LOB stream.
-//!   Each exchange message fires on every individual order book change (no 100ms
-//!   batching).  Agent 0 applies each diff to an in-memory DepthBook, then:
-//!     • SET  toko:btc_usdt:lob        — latest 10-level snapshot (any consumer)
-//!     • PUBLISH toko:btc_usdt:lob:tick — same JSON on a Pub/Sub channel so
-//!       Engine C can subscribe and process every tick without polling.
+//!   Tokocrypto combined stream subscribes to:
+//!     • btcusdt@depth@100ms  — 100 ms-batched differential LOB (Engine D HFT)
+//!     • btcusdt@aggTrade     — individual market order flow    (Engine D HFT)
+//!     • btcusdt@bookTicker   — best bid/ask snapshot           (Engine B)
+//!     • ethusdt@bookTicker   — best bid/ask snapshot           (Engine B)
+//!     • solidr@bookTicker    — SOL/IDR best bid/ask            (Engine A)
+//!     • btcidr@bookTicker    — BTC/IDR best bid/ask            (Engine A / C)
 //!
 //! Redis key schema:
-//!   toko:btc_usdt:lob       → 10-level LOB JSON snapshot        (Engine C GET)
-//!   toko:btc_usdt:lob:tick  → Pub/Sub channel, same JSON/tick   (Engine C SUB)
-//!   toko:btc_usdt:ticker    → best bid/ask ticker               (Engine B)
-//!   toko:eth_usdt:ticker    → best bid/ask ticker               (Engine B)
-//!   toko:sol_idr:ticker     → SOL/IDR best bid/ask              (Engine A)
-//!   toko:btc_idr:ticker     → BTC/IDR best bid/ask              (Engine A/C)
-//!   indo:sol_idr:ask        → Indodax SOL/IDR orderbook         (Engine A)
-//!   indo:btc_idr:ask        → Indodax BTC/IDR orderbook         (Engine A)
+//!   toko:btc_usdt:lob          → 10-level LOB JSON snapshot        (Engine C GET)
+//!   toko:btc_usdt:lob:tick     → Pub/Sub channel, same JSON/tick   (Engine C SUB)
+//!   toko:btc_usdt:ticker       → BTC/USDT best bid/ask ticker      (Engine B)
+//!   toko:eth_usdt:ticker       → ETH/USDT best bid/ask ticker      (Engine B)
+//!   toko:sol_idr:ticker        → SOL/IDR best bid/ask              (Engine A)
+//!   toko:btc_idr:ticker        → BTC/IDR best bid/ask              (Engine A / C)
+//!   indo:sol_idr:ask           → Indodax SOL/IDR orderbook         (Engine A)
+//!   indo:btc_idr:ask           → Indodax BTC/IDR orderbook         (Engine A)
+//!   telemetry:engine_d         → Engine D HFT snapshot (1 s cadence)
+
+mod engine_d_hft;
 
 use anyhow::Result;
+use engine_d_hft::HFTEngine;
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-// ── Tokocrypto combined stream URL ────────────────────────────────────────────
+// ── Tokocrypto combined stream URL (HFT branch) ───────────────────────────────
 //
-// btcusdt@depth        — real-time differential LOB stream.
-//                        Fires on every individual order book change.
-//                        No time qualifier = maximum tick resolution.
-//                        Engine C subscribes to toko:btc_usdt:lob:tick.
+// btcusdt@depth@100ms   — 100 ms-batched differential LOB updates.
+//                         Feeds Engine D's DepthBook for micro-price / OBI.
 //
-// btcusdt@bookTicker   — best bid/ask for Engine B ratio signal
-// ethusdt@bookTicker   — best bid/ask for Engine B ratio signal
-// solidr@bookTicker    — SOL/IDR best bid/ask for Engine A
-// btcidr@bookTicker    — BTC/IDR best bid/ask for Engine A + Engine C execution
+// btcusdt@aggTrade      — individual market order fills.
+//                         Provides TFI signal and fill-simulator price.
+//
+// btcusdt@bookTicker    — best bid/ask for Engine B ratio signal.
+// ethusdt@bookTicker    — best bid/ask for Engine B ratio signal.
+// solidr@bookTicker     — SOL/IDR best bid/ask for Engine A.
+// btcidr@bookTicker     — BTC/IDR best bid/ask for Engine A + Engine C.
 const TOKO_WSS_DEFAULT: &str = concat!(
     "wss://stream-cloud.tokocrypto.site/stream?streams=",
-    "btcusdt@depth",
+    "btcusdt@depth@100ms",
+    "/btcusdt@aggTrade",
     "/btcusdt@bookTicker",
     "/ethusdt@bookTicker",
     "/solidr@bookTicker",
@@ -62,8 +69,8 @@ const INDO_STATIC_TOKEN: &str =
 /// Keys are the price strings exactly as received from the exchange (avoids
 /// floating-point equality issues in HashMap lookups).  Values are quantities.
 struct DepthBook {
-    bids: HashMap<String, f64>,  // price_str → qty (descending on read)
-    asks: HashMap<String, f64>,  // price_str → qty (ascending on read)
+    bids: HashMap<String, f64>,
+    asks: HashMap<String, f64>,
     tick_count: u64,
 }
 
@@ -112,19 +119,27 @@ struct CombinedMessage {
     data: serde_json::Value,
 }
 
-/// Real-time differential LOB update (btcusdt@depth, no time qualifier).
-/// Fires on every individual order book change.
+/// Real-time differential LOB update (btcusdt@depth@100ms).
 #[derive(Deserialize)]
 struct DepthDiff {
-    /// Bid level updates: [price_str, qty_str].  qty="0" means remove level.
-    #[serde(rename = "b")]
-    bids: Vec<[String; 2]>,
-    /// Ask level updates: [price_str, qty_str].  qty="0" means remove level.
-    #[serde(rename = "a")]
-    asks: Vec<[String; 2]>,
+    #[serde(rename = "b")] bids: Vec<[String; 2]>,
+    #[serde(rename = "a")] asks: Vec<[String; 2]>,
 }
 
-/// BookTicker: best bid/ask snapshot
+/// Aggregated trade (btcusdt@aggTrade).
+/// is_buyer_maker = true  → the buyer was the passive maker; seller was aggressor.
+/// is_buyer_maker = false → the seller was the passive maker; buyer was aggressor.
+#[derive(Deserialize)]
+struct AggTrade {
+    /// Price in quote currency (USDT on Tokocrypto; IDR on btcidr streams).
+    #[serde(rename = "p")] price: String,
+    /// Trade quantity in base currency (BTC).
+    #[serde(rename = "q")] qty: String,
+    /// true = buy order was the maker (passive); aggressor was a seller.
+    #[serde(rename = "m")] is_buyer_maker: bool,
+}
+
+/// BookTicker: best bid/ask snapshot.
 #[derive(Deserialize)]
 struct BookTicker {
     #[serde(rename = "b")] bid_price: String,
@@ -156,6 +171,10 @@ fn micros_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64
 }
 
+fn millis_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
 /// {"ts":…µs,"ask":…,"bid":…,"volume":…}
 fn ticker_json(ask: f64, bid: f64, volume: f64) -> String {
     format!(r#"{{"ts":{},"ask":{:.8},"bid":{:.8},"volume":{:.4}}}"#,
@@ -183,7 +202,6 @@ async fn redis_set(con: &mut redis::aio::MultiplexedConnection, key: &str, value
 }
 
 /// SET the key AND PUBLISH to the Pub/Sub tick channel (key + ":tick").
-/// Engine C subscribes to the channel for zero-latency tick delivery.
 async fn redis_set_and_publish(
     con: &mut redis::aio::MultiplexedConnection,
     key: &str,
@@ -199,20 +217,32 @@ async fn redis_set_and_publish(
     }
 }
 
-// ── Tokocrypto WebSocket loop ─────────────────────────────────────────────────
+// ── Tokocrypto WebSocket loop (HFT branch) ────────────────────────────────────
 
 async fn stream_loop(
     con: &mut redis::aio::MultiplexedConnection,
     wss_url: &str,
 ) -> Result<()> {
-    info!("Connecting to Tokocrypto WSS: {}", wss_url);
+    info!("Connecting to Tokocrypto WSS (HFT): {}", wss_url);
 
-    // Fresh DepthBook on every (re)connect — avoids stale state from previous session
+    // Fresh state on every (re)connect — avoids stale data from previous session.
     let mut btcusdt_book = DepthBook::new();
+
+    // Engine D — instantiated outside the tick loop per PRD §4 (Prompt 4).
+    let mut engine_d = HFTEngine::init();
+
+    // Last known aggTrade values; carried across depth-only ticks.
+    let mut last_trade_price: f64 = 0.0;
+    let mut last_trade_vol: f64   = 0.0;
+    let mut last_is_buyer_maker: bool = true;
+
+    // Telemetry: fire a Redis write every 1 s without blocking the tick loop.
+    // tokio::spawn is intentionally here in the I/O loop — NOT inside tick().
+    let mut last_telemetry = Instant::now();
 
     let url = url::Url::parse(wss_url)?;
     let (ws_stream, _) = connect_async(url).await?;
-    info!("Tokocrypto WSS connected. Streaming tick-level market data.");
+    info!("Tokocrypto WSS connected (HFT). Streaming btcusdt@depth@100ms + btcusdt@aggTrade.");
 
     let (_, mut reader) = ws_stream.split();
 
@@ -236,41 +266,79 @@ async fn stream_loop(
 
         match combined.stream.as_str() {
 
-            // ── BTC/USDT real-time tick diff (Engine C) ──────────────────────
-            // Fires on every individual order-book change — no time batching.
-            // Maintains in-memory DepthBook; publishes snapshot after each tick.
-            "btcusdt@depth" => {
+            // ── BTC/USDT 100 ms-batched depth diff (Engine D LOB) ────────────
+            // Apply the diff to the in-memory DepthBook, extract top-of-book,
+            // publish the LOB snapshot for Engine C, then call Engine D.tick().
+            "btcusdt@depth@100ms" => {
                 let diff: DepthDiff = match serde_json::from_value(combined.data) {
                     Ok(d)  => d,
-                    Err(e) => { warn!("btcusdt@depth parse error: {}", e); continue; }
+                    Err(e) => { warn!("depth@100ms parse error: {}", e); continue; }
                 };
 
                 btcusdt_book.apply(&diff.bids, &diff.asks);
-
                 if !btcusdt_book.is_ready() { continue; }
 
                 let (bids, asks) = btcusdt_book.top(10);
                 if bids.is_empty() || asks.is_empty() { continue; }
 
-                // Log first ready tick and every 1 000 ticks thereafter
+                // Periodic log: tick 1, then every 1 000 ticks.
                 if btcusdt_book.tick_count == 1 || btcusdt_book.tick_count % 1_000 == 0 {
                     info!(
-                        "BTC/USDT LOB tick #{} — best bid={:.2} ask={:.2}",
+                        "[EngineD] LOB tick #{} — best bid={:.0} IDR  ask={:.0} IDR",
                         btcusdt_book.tick_count, bids[0].0, asks[0].0
                     );
                 }
 
+                // Publish LOB snapshot for Engine C.
                 let json = lob_json(&bids, &asks);
-                // SET for any polling consumer + PUBLISH for Engine C subscription
                 redis_set_and_publish(con, "toko:btc_usdt:lob", &json).await;
+
+                // ── Engine D tick (synchronous, zero-allocation) ──────────────
+                let now_ms = millis_now();
+                let _out = engine_d.tick(
+                    bids[0].0, bids[0].1,   // best_bid, bid_vol
+                    asks[0].0, asks[0].1,   // best_ask, ask_vol
+                    last_trade_price,
+                    last_trade_vol,
+                    last_is_buyer_maker,
+                    now_ms,
+                );
+            }
+
+            // ── BTC/USDT aggTrade (Engine D TFI + fill simulator) ────────────
+            // Parse the market order, update last-trade cache, then immediately
+            // drive Engine D with the current top-of-book (if ready).
+            "btcusdt@aggTrade" => {
+                let trade: AggTrade = match serde_json::from_value(combined.data) {
+                    Ok(t)  => t,
+                    Err(e) => { warn!("aggTrade parse error: {}", e); continue; }
+                };
+
+                let price = trade.price.parse::<f64>().unwrap_or(0.0);
+                let qty   = trade.qty.parse::<f64>().unwrap_or(0.0);
+                if price <= 0.0 || qty <= 0.0 { continue; }
+
+                last_trade_price    = price;
+                last_trade_vol      = qty;
+                last_is_buyer_maker = trade.is_buyer_maker;
+
+                // Fire Engine D immediately on every aggTrade if the book is ready.
+                if btcusdt_book.is_ready() {
+                    let (bids, asks) = btcusdt_book.top(1);
+                    if !bids.is_empty() && !asks.is_empty() {
+                        let now_ms = millis_now();
+                        let _out = engine_d.tick(
+                            bids[0].0, bids[0].1,
+                            asks[0].0, asks[0].1,
+                            price, qty,
+                            trade.is_buyer_maker,
+                            now_ms,
+                        );
+                    }
+                }
             }
 
             // ── BTC/USDT bookTicker ──────────────────────────────────────────
-            // Engine B: writes toko:btc_usdt:ticker for ratio signal.
-            // Engine C: fires on every top-of-book change (event-driven, not
-            //           batched at 1s like @depth).  We build the LOB snapshot
-            //           from the current DepthBook (levels 2–10) and override
-            //           level 1 with the bookTicker values (most current ToB).
             "btcusdt@bookTicker" => {
                 let bt = match parse_book_ticker(&combined.data) {
                     Some(b) => b,
@@ -282,13 +350,11 @@ async fn stream_loop(
                 let ask_qty = bt.ask_qty.parse::<f64>().unwrap_or(0.0);
                 if bid <= 0.0 || ask <= 0.0 { continue; }
 
-                // Engine B ticker (best bid/ask + bid side liquidity)
                 redis_set(con, "toko:btc_usdt:ticker", &ticker_json(ask, bid, bid_qty)).await;
 
-                // Engine C LOB tick — event-driven on every ToB change
+                // Override top-of-book in the LOB snapshot with the freshest values.
                 if btcusdt_book.is_ready() {
                     let (mut bids, mut asks) = btcusdt_book.top(10);
-                    // Override top-of-book with bookTicker (fresher than @depth snapshot)
                     if !bids.is_empty() { bids[0] = (bid, bid_qty); }
                     if !asks.is_empty() { asks[0] = (ask, ask_qty); }
                     let json = lob_json(&bids, &asks);
@@ -337,9 +403,37 @@ async fn stream_loop(
 
             other => { warn!("Unhandled stream: {}", other); }
         }
+
+        // ── State 4: Telemetry Offload ────────────────────────────────────────
+        // Every 1.0 s, snapshot Engine D state and push it to Redis from a
+        // separate async task so the HFT tick loop is never blocked by I/O.
+        // tokio::spawn lives HERE — not inside engine_d.tick().
+        if last_telemetry.elapsed() >= Duration::from_secs(1) {
+            let inv_btc    = engine_d.inventory_btc;
+            let pnl_idr    = engine_d.pnl_idr;
+            let trades     = engine_d.total_trades;
+            let variance   = engine_d.variance;
+
+            // Clone the multiplexed connection — cheap, no new TCP socket.
+            let mut tel_con = con.clone();
+
+            tokio::spawn(async move {
+                // Serialize into a fixed-layout JSON string (no heap alloc in tick path).
+                let payload = format!(
+                    r#"{{"ts":{},"inventory_btc":{:.8},"pnl_idr":{:.2},"total_trades":{},"variance":{:.10}}}"#,
+                    millis_now(), inv_btc, pnl_idr, trades, variance
+                );
+                if let Err(e) = tel_con.set::<_, _, ()>("telemetry:engine_d", &payload).await {
+                    // Non-fatal — telemetry failure must never crash the HFT loop.
+                    warn!("Engine D telemetry Redis write failed: {}", e);
+                }
+            });
+
+            last_telemetry = Instant::now();
+        }
     }
 
-    info!("Tokocrypto WSS stream loop ended.");
+    info!("Tokocrypto WSS stream loop ended (HFT).");
     Ok(())
 }
 
@@ -374,7 +468,7 @@ async fn indo_stream_loop(con: &mut redis::aio::MultiplexedConnection) -> Result
             Err(e) => { warn!("Indodax parse error: {} — raw: {:.80}", e, text); continue; }
         };
 
-        // Auth ACK → subscribe to orderbook channels
+        // Auth ACK → subscribe to orderbook channels.
         if push.id == Some(1) && !subscribed {
             info!("Indodax authenticated. Subscribing to BTC/IDR and SOL/IDR orderbooks.");
             for (id, channel) in [(2u64, "market:order-book-btcidr"), (3, "market:order-book-solidr")] {
@@ -395,7 +489,6 @@ async fn indo_stream_loop(con: &mut redis::aio::MultiplexedConnection) -> Result
             data_val.get(side)?.as_array()?.first()?.get("price")?.as_str()?.parse::<f64>().ok()
         };
 
-        // Sum idr_volume across top-5 levels for Engine A's volume liquidity check
         let parse_idr_vol = |side: &str| -> f64 {
             data_val.get(side).and_then(|a| a.as_array()).map(|arr| {
                 arr.iter().take(5)
@@ -461,7 +554,7 @@ async fn main() -> Result<()> {
 
     let mut indo_con = con.clone();
 
-    // Indodax runs in a background task with its own exponential-backoff reconnect
+    // Indodax runs in a background task with its own exponential-backoff reconnect.
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(1);
         loop {
@@ -474,7 +567,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Tokocrypto main loop with exponential-backoff reconnect
+    // Tokocrypto main loop with exponential-backoff reconnect.
     let mut delay = Duration::from_secs(1);
     loop {
         match stream_loop(&mut con, &wss_url).await {
