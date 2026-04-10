@@ -7,6 +7,13 @@
 # without port conflicts.
 #
 # Agents A / B / C are intentionally excluded — this stack is Engine D only.
+#
+# Security notes:
+#   • Redis requires password auth (REDIS_PASSWORD in .env).
+#   • REDIS_URL carries credentials: redis://:${REDIS_PASSWORD}@redis_hft:6379
+#     — the URL is never logged by agent_0 (see main.rs).
+#   • INDO_WS_TOKEN moves the Indodax JWT out of source code into .env.
+#   • All secrets flow from .env only — that file is gitignored.
 
 version: "3.9"
 
@@ -28,10 +35,13 @@ services:
     networks: [mammon_hft_net]
     ports:
       - "6380:6379"          # avoids conflict with main stack's 6379
+    # Require password auth — rejects unauthenticated connections on the network.
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme}
     volumes:
       - redis_hft_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Pass -a so the health-check itself can authenticate.
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -62,11 +72,15 @@ services:
     container_name: mammon_agent0_hft
     networks: [mammon_hft_net]
     environment:
-      REDIS_URL:        redis://redis_hft:6379
+      # Redis URL includes password so agent_0 authenticates on connect.
+      # The URL is intentionally never logged — see main.rs credential handling.
+      REDIS_URL:        redis://:${REDIS_PASSWORD:-changeme}@redis_hft:6379
       TOKO_API_KEY:     ${TOKO_API_KEY}
       TOKO_API_SECRET:  ${TOKO_API_SECRET}
       INDO_API_KEY:     ${INDO_API_KEY}
       INDO_API_SECRET:  ${INDO_API_SECRET}
+      # Indodax WebSocket JWT — sourced from .env, never hardcoded in source.
+      INDO_WS_TOKEN:    ${INDO_WS_TOKEN}
       # HFT stream URL: 100ms-batched depth + aggTrade for Engine D
       TOKO_STREAM_URL: "wss://stream-cloud.tokocrypto.site/stream?streams=btcusdt@depth@100ms/btcusdt@aggTrade/btcusdt@bookTicker/ethusdt@bookTicker/solidr@bookTicker/btcidr@bookTicker"
       RUST_LOG: info

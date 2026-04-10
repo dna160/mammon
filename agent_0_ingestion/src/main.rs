@@ -57,10 +57,8 @@ const TOKO_WSS_DEFAULT: &str = concat!(
 
 // ── Indodax WebSocket ─────────────────────────────────────────────────────────
 const INDO_WSS: &str = "wss://ws3.indodax.com/ws/";
-const INDO_STATIC_TOKEN: &str =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\
-     .eyJleHAiOjE5NDY2MTg0MTV9\
-     .UR1lBM6Eqh0yWz-PVirw1uPCxe60FdchR8eNVdsskeo";
+// INDO_WS_TOKEN is loaded from the environment variable INDO_WS_TOKEN at runtime.
+// It must NOT be hardcoded here. Set it in your .env file (never committed to git).
 
 // ── In-memory limit-order book ────────────────────────────────────────────────
 
@@ -439,7 +437,10 @@ async fn stream_loop(
 
 // ── Indodax WebSocket loop ────────────────────────────────────────────────────
 
-async fn indo_stream_loop(con: &mut redis::aio::MultiplexedConnection) -> Result<()> {
+async fn indo_stream_loop(
+    con: &mut redis::aio::MultiplexedConnection,
+    indo_ws_token: &str,
+) -> Result<()> {
     info!("Connecting to Indodax WSS: {}", INDO_WSS);
 
     let url = url::Url::parse(INDO_WSS)?;
@@ -448,7 +449,7 @@ async fn indo_stream_loop(con: &mut redis::aio::MultiplexedConnection) -> Result
 
     let (mut writer, mut reader) = ws_stream.split();
 
-    let auth = serde_json::json!({ "params": { "token": INDO_STATIC_TOKEN }, "id": 1 });
+    let auth = serde_json::json!({ "params": { "token": indo_ws_token }, "id": 1 });
     writer.send(Message::Text(auth.to_string())).await?;
 
     let mut subscribed = false;
@@ -524,25 +525,57 @@ async fn main() -> Result<()> {
         .with_env_filter("agent_0_ingestion=info,info")
         .init();
 
+    // ── Credential loading ────────────────────────────────────────────────────
+    // All secrets come from environment variables only — never from source code.
+    // The .env file is gitignored; secrets must never be committed.
+
     let toko_key    = std::env::var("TOKO_API_KEY").unwrap_or_default();
     let toko_secret = std::env::var("TOKO_API_SECRET").unwrap_or_default();
     let indo_key    = std::env::var("INDO_API_KEY").unwrap_or_default();
     let _indo_secret = std::env::var("INDO_API_SECRET").unwrap_or_default();
-    let redis_url   = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let wss_url     = std::env::var("TOKO_STREAM_URL").unwrap_or_else(|_| TOKO_WSS_DEFAULT.to_string());
+
+    // INDO_WS_TOKEN: Indodax WebSocket JWT.  Must be set; binary exits if absent.
+    let indo_ws_token = std::env::var("INDO_WS_TOKEN").unwrap_or_default();
+
+    let redis_url   = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let wss_url     = std::env::var("TOKO_STREAM_URL")
+        .unwrap_or_else(|_| TOKO_WSS_DEFAULT.to_string());
+
+    // ── Credential validation ─────────────────────────────────────────────────
+    // Log a redacted prefix/suffix only (never the full key).
+    // Use saturating slice to avoid panics on short/empty values.
+    fn redact(s: &str) -> String {
+        let n = s.len();
+        if n < 8 { return "[too short]".to_string(); }
+        format!("{}…{}", &s[..4], &s[n - 4..])
+    }
 
     if toko_key.is_empty() || toko_secret.is_empty() {
-        warn!("TOKO_API_KEY / TOKO_API_SECRET not set — market-data streams work without them.");
+        warn!("TOKO_API_KEY / TOKO_API_SECRET not set — market-data WebSocket works without auth, but order execution will fail.");
     } else {
-        info!("Toko credentials loaded (key: {}…{})", &toko_key[..4], &toko_key[toko_key.len()-4..]);
-    }
-    if indo_key.is_empty() {
-        warn!("INDO_API_KEY not set — Indodax market data uses public static token.");
-    } else {
-        info!("Indo credentials loaded (key: {}…{})", &indo_key[..4], &indo_key[indo_key.len()-4..]);
+        info!("Toko credentials loaded (key: {})", redact(&toko_key));
     }
 
-    info!("Connecting to Redis at {}", redis_url);
+    if indo_key.is_empty() {
+        warn!("INDO_API_KEY not set.");
+    } else {
+        info!("Indo credentials loaded (key: {})", redact(&indo_key));
+    }
+
+    if indo_ws_token.is_empty() {
+        // Indodax WebSocket requires a token; without it we cannot subscribe.
+        // Log a warning but continue — the background task will fail gracefully.
+        warn!("INDO_WS_TOKEN not set — Indodax WebSocket will not authenticate.");
+    } else {
+        info!("Indodax WS token loaded ({} bytes)", indo_ws_token.len());
+    }
+
+    // ── Redis connection ──────────────────────────────────────────────────────
+    // REDIS_URL may include a password: redis://:password@host:port
+    // e.g. redis://:s3cr3t@redis_hft:6379
+    // The URL is never logged to avoid leaking credentials.
+    info!("Connecting to Redis…");
     let client = redis::Client::open(redis_url)?;
 
     let mut con = loop {
@@ -558,7 +591,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(1);
         loop {
-            match indo_stream_loop(&mut indo_con).await {
+            match indo_stream_loop(&mut indo_con, &indo_ws_token).await {
                 Ok(())  => info!("Indodax WSS disconnected cleanly. Reconnecting in {:?}…", delay),
                 Err(e)  => error!("Indodax WSS error: {}. Reconnecting in {:?}…", e, delay),
             }
