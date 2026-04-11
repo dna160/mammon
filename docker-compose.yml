@@ -39,12 +39,14 @@ services:
   agent_0:
     build: ./agent_0_ingestion
     networks: [mammon_net]
+    # ISP DNS poisons api.binance.com / stream.binance.com → use Google DNS.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       REDIS_URL: redis://redis:6379
-      TOKO_API_KEY: ${TOKO_API_KEY}
-      TOKO_API_SECRET: ${TOKO_API_SECRET}
-      INDO_API_KEY: ${INDO_API_KEY}
-      INDO_API_SECRET: ${INDO_API_SECRET}
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET}
     depends_on:
       redis:
         condition: service_healthy

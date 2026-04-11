@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 anyhow = "1"
 url = "2"
-# REST client for Tokocrypto order execution (rustls — no OpenSSL).
+# REST client for Binance Spot V3 order execution (rustls — no OpenSSL).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # HMAC-SHA256 request signing.
 hmac  = "0.12"
