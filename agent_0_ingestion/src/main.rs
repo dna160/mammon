@@ -114,7 +114,6 @@ enum OrderCmd {
     SkewAsk  { symbol: String, ask_price: f64 },
     SkewBid  { symbol: String, bid_price: f64 },
     CancelAll { symbol: String },
-    CheckFills { symbol: String },
     PanicSell  { symbol: String, qty: f64 },
 }
 
@@ -137,7 +136,6 @@ struct CoinState {
     real_pnl_usd:     f64,
     real_inventory:   f64,
     real_total_trades: u64,
-    last_fill_poll:   Instant,
 }
 
 impl CoinState {
@@ -158,7 +156,6 @@ impl CoinState {
             real_pnl_usd:      0.0,
             real_inventory:    0.0,
             real_total_trades: 0,
-            last_fill_poll:    past,
         }
     }
 }
@@ -173,9 +170,6 @@ const BALANCE_REFRESH_S: u64 = 30;
 
 /// Minimum FDUSD to place a new bid tranche.
 const MIN_BID_FDUSD: f64 = binance_rest::TARGET_NOTIONAL_USD;
-
-/// Fill poll interval in seconds (after each requote).
-const FILL_POLL_S: u64 = 2;
 
 fn moved_enough(new_price: f64, old_price: f64, tick_size: f64) -> bool {
     if old_price == 0.0 { return true; }
@@ -210,11 +204,12 @@ fn spawn_telemetry_insert(
 }
 
 async fn order_manager(
-    client:    std::sync::Arc<BinanceClient>,
-    mut rx:    mpsc::Receiver<OrderCmd>,
+    client:     std::sync::Arc<BinanceClient>,
+    mut rx:     mpsc::Receiver<OrderCmd>,
     mut redis_con: redis::aio::MultiplexedConnection,
-    fill_tx:   mpsc::Sender<FillNotif>,
-    db:        Arc<tokio_postgres::Client>,
+    fill_tx:    mpsc::Sender<FillNotif>,
+    db:         Arc<tokio_postgres::Client>,
+    mut uds_rx: mpsc::Receiver<ExecutionReport>,
 ) {
     // Per-coin state
     let mut states: HashMap<String, CoinState> = COIN_CONFIGS.iter()
@@ -261,9 +256,8 @@ async fn order_manager(
         Err(e) => error!("[OrderMgr] Initial balance fetch error: {}", e),
     }
 
-    // ── Main receive loop ─────────────────────────────────────────────────────
-    while let Some(cmd) = rx.recv().await {
-
+    // ── Main receive loop (tokio::select! multiplexes OrderCmd + UDS fills) ───
+    loop {
         // Refresh balances if stale (shared across all coins).
         if last_bal_refresh.elapsed().as_secs() >= BALANCE_REFRESH_S {
             match client.get_balances().await {
@@ -276,6 +270,76 @@ async fn order_manager(
                 Err(e) => error!("[OrderMgr] balance refresh error: {}", e),
             }
         }
+
+        tokio::select! {
+
+            // ── UDS execution report ──────────────────────────────────────────
+            Some(rpt) = uds_rx.recv() => {
+                if rpt.event_type != "executionReport" { continue; }
+                if rpt.order_status != "FILLED" && rpt.order_status != "PARTIALLY_FILLED" { continue; }
+
+                let symbol  = &rpt.symbol;
+                let qty:  f64 = rpt.last_qty.parse().unwrap_or(0.0);
+                let price:f64 = rpt.last_price.parse().unwrap_or(0.0);
+                if qty <= 0.0 || price <= 0.0 { continue; }
+                let is_buyer = rpt.side == "BUY";
+                let notional = qty * price;
+
+                // Estimate fee in USD: if fee is in FDUSD/USD-pegged asset use directly,
+                // otherwise approximate via fee_qty * price.
+                let fee_raw: f64 = rpt.fee_qty.parse().unwrap_or(0.0);
+                let fee_usd = if rpt.fee_asset.as_deref().map_or(false, |a| a.ends_with("USD") || a == "FDUSD") {
+                    fee_raw
+                } else {
+                    fee_raw * price
+                };
+
+                if let Some(s) = states.get_mut(symbol) {
+                    if rpt.trade_id > 0 && rpt.trade_id as u64 > s.last_trade_id {
+                        s.last_trade_id = rpt.trade_id as u64;
+                    }
+                    if is_buyer {
+                        s.real_inventory += qty;
+                        s.real_pnl_usd   -= notional + fee_usd;
+                    } else {
+                        s.real_inventory -= qty;
+                        s.real_pnl_usd   += notional - fee_usd;
+                    }
+                    s.real_total_trades += 1;
+
+                    let _ = fill_tx.try_send((symbol.clone(), is_buyer, price, qty, fee_usd));
+                    last_bal_refresh = Instant::now()
+                        .checked_sub(Duration::from_secs(BALANCE_REFRESH_S + 1))
+                        .unwrap_or_else(Instant::now);
+
+                    let fp = format!(
+                        r#"{{"ts":{},"tradeId":{},"orderId":{},"side":"{}","price":{:.8},"qty":{:.8},"notional":{:.4},"fee":{:.4},"pnl_running":{:.2},"inventory":{:.8},"total_trades":{}}}"#,
+                        rpt.transact_ms, rpt.trade_id, rpt.order_id,
+                        if is_buyer { "BUY" } else { "SELL" },
+                        price, qty, notional, fee_usd,
+                        s.real_pnl_usd, s.real_inventory, s.real_total_trades
+                    );
+                    let key = format!("engine_d:{}:last_fill", symbol);
+                    let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
+                    spawn_telemetry_insert(Arc::clone(&db), symbol.clone(), notional, is_buyer, fee_usd);
+
+                    info!(
+                        "[{}][UDS fill] orderId={} {} {:.8} @ {:.8}  notional={:.4}  fee={:.4}  pnl={:.2}  inv={:+.8}",
+                        symbol, rpt.order_id,
+                        if is_buyer { "BUY " } else { "SELL" },
+                        qty, price, notional, fee_usd,
+                        s.real_pnl_usd, s.real_inventory
+                    );
+                }
+                continue;
+            }
+
+            // ── OrderCmd from the stream loop ─────────────────────────────────
+            cmd = rx.recv() => {
+                let cmd = match cmd {
+                    Some(c) => c,
+                    None    => break,      // channel closed — shutdown
+                };
 
         match cmd {
 
@@ -309,56 +373,6 @@ async fn order_manager(
                     } else {
                         warn!("[{}] PanicSell qty={:.8} too small — skipped", symbol, qty);
                     }
-                }
-            }
-
-            // ── Immediate fill check ──────────────────────────────────────────
-            OrderCmd::CheckFills { symbol } => {
-                let (last_id, lot_step) = match states.get(&symbol) {
-                    Some(s) => (s.last_trade_id, s.lot_step),
-                    None    => continue,
-                };
-                match client.fetch_trades(&symbol, last_id, 20).await {
-                    Ok(fills) => {
-                        for fill in &fills {
-                            if fill.trade_id <= last_id { continue; }
-                            let s = states.get_mut(&symbol).unwrap();
-                            s.last_trade_id = fill.trade_id;
-                            let notional = if fill.quote_qty > 0.0 { fill.quote_qty } else { fill.price * fill.qty };
-                            if fill.is_buyer {
-                                s.real_inventory += fill.qty;
-                                s.real_pnl_usd   -= notional + fill.trading_fee_usd;
-                            } else {
-                                s.real_inventory -= fill.qty;
-                                s.real_pnl_usd   += notional - fill.trading_fee_usd;
-                            }
-                            s.real_total_trades += 1;
-                            let _ = fill_tx.try_send((symbol.clone(), fill.is_buyer, fill.price, fill.qty, fill.trading_fee_usd));
-                            last_bal_refresh = Instant::now()
-                                .checked_sub(Duration::from_secs(BALANCE_REFRESH_S + 1))
-                                .unwrap_or_else(Instant::now);
-                            let s = states.get(&symbol).unwrap();
-                            info!(
-                                "[{}][RealFill cross] tradeId={} {} {:.8} @ {:.8}  notional={:.4}  fee={:.4}  pnl={:.2}  inv={:+.8}",
-                                symbol, fill.trade_id,
-                                if fill.is_buyer { "BUY " } else { "SELL" },
-                                fill.qty, fill.price, notional,
-                                fill.trading_fee_usd, s.real_pnl_usd, s.real_inventory
-                            );
-                            let fp = format!(
-                                r#"{{"ts":{},"tradeId":{},"orderId":{},"side":"{}","price":{:.8},"qty":{:.8},"notional":{:.4},"fee":{:.4},"pnl_running":{:.2},"inventory":{:.8},"total_trades":{}}}"#,
-                                fill.time_ms, fill.trade_id, fill.order_id,
-                                if fill.is_buyer { "BUY" } else { "SELL" },
-                                fill.price, fill.qty, notional, fill.trading_fee_usd,
-                                s.real_pnl_usd, s.real_inventory, s.real_total_trades
-                            );
-                            let key = format!("engine_d:{}:last_fill", symbol);
-                            let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
-                            spawn_telemetry_insert(Arc::clone(&db), symbol.clone(), notional, fill.is_buyer, fill.trading_fee_usd);
-                            let _ = lot_step; // suppress unused warning
-                        }
-                    }
-                    Err(e) => warn!("[{}] CheckFills poll error: {}", symbol, e),
                 }
             }
 
@@ -459,54 +473,6 @@ async fn order_manager(
 
                 s.last_requote = Instant::now();
 
-                // Poll fills after each requote.
-                let s = states.get_mut(&symbol).unwrap();
-                if s.last_fill_poll.elapsed().as_secs() >= FILL_POLL_S {
-                    let last_id = s.last_trade_id;
-                    match client.fetch_trades(&symbol, last_id, 50).await {
-                        Ok(fills) => {
-                            for fill in &fills {
-                                if fill.trade_id <= last_id { continue; }
-                                let s2 = states.get_mut(&symbol).unwrap();
-                                s2.last_trade_id = fill.trade_id;
-                                let notional = if fill.quote_qty > 0.0 { fill.quote_qty } else { fill.price * fill.qty };
-                                if fill.is_buyer {
-                                    s2.real_inventory += fill.qty;
-                                    s2.real_pnl_usd   -= notional + fill.trading_fee_usd;
-                                } else {
-                                    s2.real_inventory -= fill.qty;
-                                    s2.real_pnl_usd   += notional - fill.trading_fee_usd;
-                                }
-                                s2.real_total_trades += 1;
-                                let _ = fill_tx.try_send((symbol.clone(), fill.is_buyer, fill.price, fill.qty, fill.trading_fee_usd));
-                                last_bal_refresh = Instant::now()
-                                    .checked_sub(Duration::from_secs(BALANCE_REFRESH_S + 1))
-                                    .unwrap_or_else(Instant::now);
-                                let s2 = states.get(&symbol).unwrap();
-                                info!(
-                                    "[{}][RealFill] tradeId={} {} {:.8} @ {:.8}  notional={:.4}  fee={:.4}  pnl={:.2}  inv={:+.8}",
-                                    symbol, fill.trade_id,
-                                    if fill.is_buyer { "BUY " } else { "SELL" },
-                                    fill.qty, fill.price, notional,
-                                    fill.trading_fee_usd, s2.real_pnl_usd, s2.real_inventory
-                                );
-                                let fp = format!(
-                                    r#"{{"ts":{},"tradeId":{},"orderId":{},"side":"{}","price":{:.8},"qty":{:.8},"notional":{:.4},"fee":{:.4},"pnl_running":{:.2},"inventory":{:.8},"total_trades":{}}}"#,
-                                    fill.time_ms, fill.trade_id, fill.order_id,
-                                    if fill.is_buyer { "BUY" } else { "SELL" },
-                                    fill.price, fill.qty, notional, fill.trading_fee_usd,
-                                    s2.real_pnl_usd, s2.real_inventory, s2.real_total_trades
-                                );
-                                let key = format!("engine_d:{}:last_fill", symbol);
-                                let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
-                                spawn_telemetry_insert(Arc::clone(&db), symbol.clone(), notional, fill.is_buyer, fill.trading_fee_usd);
-                            }
-                            states.get_mut(&symbol).unwrap().last_fill_poll = Instant::now();
-                        }
-                        Err(e) => warn!("[{}] fill poll error: {}", symbol, e),
-                    }
-                }
-
                 // Publish order state snapshot.
                 let s = states.get(&symbol).unwrap();
                 let payload = format!(
@@ -520,8 +486,10 @@ async fn order_manager(
                 let key = format!("engine_d:{}:orders", symbol);
                 let _ = redis_con.set::<_, _, ()>(&key, &payload).await;
             }
-        }
-    }
+        }      // close: match cmd
+        }      // close: cmd = rx.recv() select arm
+        }      // close: tokio::select!
+    }          // close: loop
 
     // Cleanup on channel close.
     info!("[OrderMgr] channel closed — cancelling remaining orders…");
@@ -569,6 +537,25 @@ impl DepthBook {
     }
 
     fn is_ready(&self) -> bool { !self.bids.is_empty() && !self.asks.is_empty() }
+}
+
+// ── User Data Stream execution report ─────────────────────────────────────────
+
+/// Inbound `executionReport` event from the Binance User Data Stream.
+/// Only `FILLED` and `PARTIALLY_FILLED` events are acted upon by order_manager.
+#[derive(Debug, Deserialize, Clone)]
+struct ExecutionReport {
+    #[serde(rename = "e")] event_type:    String,   // "executionReport"
+    #[serde(rename = "s")] symbol:        String,   // "ADAFDUSD"
+    #[serde(rename = "S")] side:          String,   // "BUY" | "SELL"
+    #[serde(rename = "X")] order_status:  String,   // "FILLED" | "PARTIALLY_FILLED" | …
+    #[serde(rename = "l")] last_qty:      String,   // last executed qty (coin)
+    #[serde(rename = "L")] last_price:    String,   // last executed price
+    #[serde(rename = "n")] fee_qty:       String,   // commission amount
+    #[serde(rename = "N")] fee_asset:     Option<String>, // commission asset (may be null)
+    #[serde(rename = "T")] transact_ms:   u64,      // transaction time (ms epoch)
+    #[serde(rename = "i")] order_id:      u64,      // order ID
+    #[serde(rename = "t")] trade_id:      i64,      // trade ID (-1 if no fill yet)
 }
 
 // ── Serde models ──────────────────────────────────────────────────────────────
@@ -758,11 +745,13 @@ async fn stream_loop(
                 engines.get_mut(&symbol).unwrap().record_agg_trade(qty, trade.is_buyer_maker, now_ms);
                 *tick_aggtrade.get_mut(&symbol).unwrap() += 1;
 
+                // Cross-detection retained for logging purposes; fills handled by UDS.
                 let (req_bid, req_ask) = requested.get(&symbol).copied().unwrap_or((0.0, 0.0));
                 let cross_bid = req_bid > 0.0 && trade_price <= req_bid;
                 let cross_ask = req_ask > 0.0 && trade_price >= req_ask;
                 if cross_bid || cross_ask {
-                    let _ = order_tx.try_send(OrderCmd::CheckFills { symbol: symbol.clone() });
+                    // Fill notification now arrives via User Data Stream — no REST poll needed.
+                    let _ = (cross_bid, cross_ask); // suppress unused warning
                 }
             }
 
@@ -1025,12 +1014,98 @@ async fn main() -> Result<()> {
     let (fill_tx,  fill_rx)  = mpsc::channel::<FillNotif>(128);
     let (aq_tx,    aq_rx)    = mpsc::unbounded_channel::<AgentQUpdate>();
 
+    // ── User Data Stream ──────────────────────────────────────────────────────
+    // Opens wss://stream.binance.com:9443/ws/{listenKey}.
+    // Pushes executionReport events into uds_tx for zero-latency fill processing.
+    let (uds_tx, uds_rx) = mpsc::channel::<ExecutionReport>(1024);
+
+    {
+        let uds_client = std::sync::Arc::clone(&binance_client);
+        let uds_tx2    = uds_tx.clone();
+
+        tokio::spawn(async move {
+            // Fetch initial listenKey.
+            let mut listen_key = loop {
+                match uds_client.get_listen_key().await {
+                    Ok(k)  => { info!("[UDS] listenKey obtained."); break k; }
+                    Err(e) => {
+                        warn!("[UDS] get_listen_key failed: {}. Retry in 5s…", e);
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            };
+
+            // Keepalive: refresh every 30 minutes.
+            let keepalive_client = uds_client.clone();
+            let ka_key           = listen_key.clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep(Duration::from_secs(30 * 60)).await;
+                    match keepalive_client.keepalive_listen_key(&ka_key).await {
+                        Ok(())  => info!("[UDS] listenKey keepalive OK."),
+                        Err(e)  => warn!("[UDS] listenKey keepalive failed: {}", e),
+                    }
+                }
+            });
+
+            // WebSocket listener loop — reconnects on drop/error.
+            loop {
+                let wss = format!("wss://stream.binance.com:9443/ws/{}", listen_key);
+                info!("[UDS] Connecting to User Data Stream…");
+                let url = match url::Url::parse(&wss) {
+                    Ok(u)  => u,
+                    Err(e) => { warn!("[UDS] URL parse error: {}", e); sleep(Duration::from_secs(5)).await; continue; }
+                };
+                match connect_async(url).await {
+                    Ok((ws_stream, _)) => {
+                        info!("[UDS] User Data Stream connected.");
+                        let (_, mut reader) = ws_stream.split();
+                        while let Some(msg) = reader.next().await {
+                            let text = match msg {
+                                Ok(Message::Text(t))  => t,
+                                Ok(Message::Ping(_))
+                                | Ok(Message::Pong(_))
+                                | Ok(Message::Frame(_)) => continue,
+                                Ok(Message::Close(f)) => {
+                                    info!("[UDS] Server closed stream: {:?}", f);
+                                    break;
+                                }
+                                Ok(Message::Binary(_)) => continue,
+                                Err(e) => { warn!("[UDS] Receive error: {}", e); break; }
+                            };
+                            match serde_json::from_str::<ExecutionReport>(&text) {
+                                Ok(rpt) if rpt.event_type == "executionReport"
+                                    && (rpt.order_status == "FILLED" || rpt.order_status == "PARTIALLY_FILLED") =>
+                                {
+                                    let _ = uds_tx2.try_send(rpt);
+                                }
+                                Ok(_)   => {}  // outboundAccountPosition, balanceUpdate, etc.
+                                Err(_)  => {}  // non-executionReport JSON — ignore
+                            }
+                        }
+                        warn!("[UDS] Stream loop ended — reconnecting in 3s…");
+                    }
+                    Err(e) => {
+                        warn!("[UDS] connect_async failed: {}. Fetching new listenKey…", e);
+                        // Refresh listenKey on reconnect.
+                        match uds_client.get_listen_key().await {
+                            Ok(k)  => { listen_key = k; info!("[UDS] New listenKey obtained."); }
+                            Err(e2) => warn!("[UDS] get_listen_key retry failed: {}", e2),
+                        }
+                    }
+                }
+                sleep(Duration::from_secs(3)).await;
+            }
+        });
+        info!("[UDS] User Data Stream task spawned.");
+    }
+
     {
         let client_arc = std::sync::Arc::clone(&binance_client);
         let om_con     = con.clone();
         let om_db      = Arc::clone(&db_client);
         tokio::spawn(async move {
-            order_manager(client_arc, order_rx, om_con, fill_tx, om_db).await;
+            order_manager(client_arc, order_rx, om_con, fill_tx, om_db, uds_rx).await;
         });
         info!("Order manager task spawned — managing {} coins.", COIN_CONFIGS.len());
     }
