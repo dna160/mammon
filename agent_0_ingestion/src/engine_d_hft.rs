@@ -207,13 +207,15 @@ impl HFTEngine {
 
     /// Insert an aggTrade into the TFI ring buffer WITHOUT computing quotes.
     ///
-    /// Call from the aggTrade stream arm on every incoming trade.
+    /// Stores USD notional (qty × price) instead of raw coin volume so TFI
+    /// scales equally across BTC (~$85k/coin) and DOGE (~$0.09/coin).
     /// `is_buyer_maker = true` → seller was aggressor; `false` → buyer aggressor.
-    pub fn record_agg_trade(&mut self, qty: f64, is_buyer_maker: bool, now_ms: u64) {
-        if qty <= 0.0 { return; }
+    pub fn record_agg_trade(&mut self, qty: f64, price: f64, is_buyer_maker: bool, now_ms: u64) {
+        if qty <= 0.0 || price <= 0.0 { return; }
+        let notional_volume = qty * price;   // USD notional — normalizes across all pairs
         let sign: i8 = if !is_buyer_maker { 1 } else { -1 };
         let idx = self.tfi_head % TFI_CAP;
-        self.tfi_vols[idx] = qty;
+        self.tfi_vols[idx] = notional_volume;  // store notional, not raw qty
         self.tfi_ts[idx]   = now_ms;
         self.tfi_sign[idx] = sign;
         self.tfi_head = (self.tfi_head + 1) % TFI_CAP;
@@ -308,6 +310,12 @@ impl HFTEngine {
         let (open_bid, open_ask) = if !warmed {
             // Gate: not enough ticks to trust variance estimate.
             (None, None)
+        } else if self.inventory_coin < self.lot_step {
+            // ── Spot Bias: Zero-Inventory Aggressive Acquisition Mode ─────────
+            // Cannot sell on spot with no inventory. Tighten bid 20% to ensure fill
+            // and get inventory into the engine as fast as possible.
+            let aggressive_spread = spread_delta * 0.8;
+            (Some(snap(reservation_price - aggressive_spread)), None)
         } else {
             // 1. Regime-based structural playbook (Agent Q Oracle, every 5m).
             let (r_bid, r_ask) = match self.current_regime {

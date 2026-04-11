@@ -21,8 +21,9 @@ const BASE_URL: &str = "https://api.binance.com";
 /// Minimum order notional in FDUSD (Binance rule for all FDUSD pairs).
 pub const MIN_NOTIONAL: f64 = 5.0;
 
-/// Fixed order notional per tranche — $0.10 buffer above MIN_NOTIONAL.
-pub const TARGET_NOTIONAL_USD: f64 = 5.10;
+/// Fixed order notional per tranche — $1.00 buffer above MIN_NOTIONAL to prevent
+/// dust traps when price drops reduce position value below the $5.00 limit.
+pub const TARGET_NOTIONAL_USD: f64 = 6.00;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -436,11 +437,18 @@ pub fn round_price(price: f64, tick_size: f64) -> f64 {
     (price / tick_size).round() * tick_size
 }
 
-/// Compute coin qty to hit TARGET_NOTIONAL_USD ($5.10) at the given price.
+/// Compute coin qty to hit TARGET_NOTIONAL_USD ($6.00) at the given price.
 /// Rounds UP to the nearest lot_step so notional always meets MIN_NOTIONAL.
 pub fn qty_from_fixed_notional(price: f64, lot_step: f64) -> f64 {
-    if price <= 0.0 { return 0.0; }
-    let raw     = TARGET_NOTIONAL_USD / price;
+    qty_from_notional(TARGET_NOTIONAL_USD, price, lot_step)
+}
+
+/// Compute coin qty to hit an explicit `notional` USD at the given price.
+/// Used when the available quote balance is below TARGET_NOTIONAL_USD but
+/// still above MIN_NOTIONAL — lets the bot trade with what it actually has.
+pub fn qty_from_notional(notional: f64, price: f64, lot_step: f64) -> f64 {
+    if price <= 0.0 || notional <= 0.0 { return 0.0; }
+    let raw     = notional / price;
     let stepped = (raw / lot_step).ceil() * lot_step;
     if stepped * price < MIN_NOTIONAL { 0.0 } else { stepped }
 }

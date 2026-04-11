@@ -21,7 +21,7 @@ mod binance_rest;
 mod engine_d_hft;
 
 use anyhow::Result;
-use binance_rest::{qty_from_fixed_notional, round_price, round_qty, BinanceClient};
+use binance_rest::{qty_from_fixed_notional, qty_from_notional, round_price, round_qty, BinanceClient};
 use engine_d_hft::{HFTEngine, MarketRegime};
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
@@ -168,8 +168,10 @@ const REQUOTE_MIN_MS: u128 = 200;
 /// Refresh all balances every N seconds.
 const BALANCE_REFRESH_S: u64 = 30;
 
-/// Minimum FDUSD to place a new bid tranche.
-const MIN_BID_FDUSD: f64 = binance_rest::TARGET_NOTIONAL_USD;
+/// Minimum FDUSD to attempt a bid — $0.10 buffer above Binance's $5.00 MIN_NOTIONAL.
+/// When balance is between MIN_BID_FDUSD and TARGET_NOTIONAL_USD, the bot trades
+/// with what it has (capped at TARGET) rather than sitting completely idle.
+const MIN_BID_FDUSD: f64 = binance_rest::MIN_NOTIONAL + 0.10;
 
 fn moved_enough(new_price: f64, old_price: f64, tick_size: f64) -> bool {
     if old_price == 0.0 { return true; }
@@ -374,7 +376,8 @@ async fn order_manager(
                     if let Some(id) = s.bid_id.take() { let _ = client.cancel_order(&symbol, id).await; }
                     let fdusd = balances.get("FDUSD").copied().unwrap_or(0.0);
                     if fdusd >= MIN_BID_FDUSD {
-                        let qty = qty_from_fixed_notional(bid_price, s.lot_step);
+                        let effective_notional = fdusd.min(binance_rest::TARGET_NOTIONAL_USD);
+                        let qty = qty_from_notional(effective_notional, bid_price, s.lot_step);
                         if qty > 0.0 {
                             match client.place_limit_order(&symbol, "BUY", bid_price, qty, s.tick_size, s.lot_step).await {
                                 Ok(id) => { s.bid_id = Some(id); s.last_bid = bid_price; s.last_requote = Instant::now(); }
@@ -429,7 +432,8 @@ async fn order_manager(
                     if let Some(id) = s.bid_id.take() { let _ = client.cancel_order(&symbol, id).await; }
                     let fdusd = balances.get("FDUSD").copied().unwrap_or(0.0);
                     if fdusd >= MIN_BID_FDUSD {
-                        let qty = qty_from_fixed_notional(bid_price, s.lot_step);
+                        let effective_notional = fdusd.min(binance_rest::TARGET_NOTIONAL_USD);
+                        let qty = qty_from_notional(effective_notional, bid_price, s.lot_step);
                         if qty > 0.0 {
                             match client.place_limit_order(&symbol, "BUY", bid_price, qty, s.tick_size, s.lot_step).await {
                                 Ok(id) => { s.bid_id = Some(id); s.last_bid = bid_price; }
@@ -728,7 +732,7 @@ async fn stream_loop(
                 if qty <= 0.0 || trade_price <= 0.0 { continue; }
 
                 let now_ms = millis_now();
-                engines.get_mut(&symbol).unwrap().record_agg_trade(qty, trade.is_buyer_maker, now_ms);
+                engines.get_mut(&symbol).unwrap().record_agg_trade(qty, trade_price, trade.is_buyer_maker, now_ms);
                 *tick_aggtrade.get_mut(&symbol).unwrap() += 1;
 
                 // Cross-detection retained for logging purposes; fills handled by UDS.
