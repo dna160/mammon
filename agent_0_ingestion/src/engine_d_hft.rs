@@ -32,7 +32,7 @@ const ALPHA: f64 = 0.01;
 // Default values for the live engine parameters (overridable via Agent Q every 15m).
 const DEFAULT_LIVE_GAMMA:         f64 = 0.8;
 const DEFAULT_LIVE_MIN_SPREAD:    f64 = 5.0;
-const DEFAULT_LIVE_TFI_THRESHOLD: f64 = 1.5;
+const DEFAULT_LIVE_TFI_THRESHOLD: f64 = 65_000.0; // USD notional — safe default until Agent Q sets it
 
 // ── Market Regime (injected by Oracle every 5m) ───────────────────────────────
 
@@ -195,7 +195,7 @@ impl HFTEngine {
     pub fn update_params(&mut self, gamma: f64, min_spread: f64, tfi_threshold: f64) {
         self.live_gamma        = gamma.clamp(0.1, 1.0);
         self.live_min_spread   = min_spread.clamp(5.0, 50.0);
-        self.live_tfi_threshold = tfi_threshold.clamp(0.2, 3.0);
+        self.live_tfi_threshold = tfi_threshold.clamp(200.0, 150_000.0); // USD notional bounds (PRD §4)
     }
 
     /// Apply Agent Q Oracle regime (every 5m) injected via Redis.
@@ -303,53 +303,30 @@ impl HFTEngine {
         let optimal_bid = snap(reservation_price - spread_delta);
         let optimal_ask = snap(reservation_price + spread_delta);
 
-        // ── Execution: Regime Playbook + Inventory Safety ─────────────────────
+        // ── Execution: TFI Shield → Spot Bias → Inventory Clamping ──────────
         let warmed  = self.warm_ticks >= 20;
         let max_inv = self.max_inventory_coin;
 
         let (open_bid, open_ask) = if !warmed {
             // Gate: not enough ticks to trust variance estimate.
             (None, None)
+        } else if tfi.abs() > self.live_tfi_threshold {
+            // TFI Toxic Shield: outermost guard — pull ALL quotes regardless of
+            // inventory state. Spot Bias must NOT bypass this (gridlock fix).
+            (None, None)
         } else if self.inventory_coin < self.lot_step {
-            // ── Spot Bias: Zero-Inventory Aggressive Acquisition Mode ─────────
-            // Cannot sell on spot with no inventory. Tighten bid 20% to ensure fill
-            // and get inventory into the engine as fast as possible.
+            // Spot Bias: Zero-Inventory Aggressive Acquisition Mode.
+            // Only reachable when market is safe (TFI shield passed above).
             let aggressive_spread = spread_delta * 0.8;
             (Some(snap(reservation_price - aggressive_spread)), None)
         } else {
-            // 1. Regime-based structural playbook (Agent Q Oracle, every 5m).
-            let (r_bid, r_ask) = match self.current_regime {
-                MarketRegime::MeanReverting => {
-                    // Low volatility, balanced flow — standard 2-sided quoting.
-                    (Some(optimal_bid), Some(optimal_ask))
-                }
-                MarketRegime::RetailFrenzyUp => {
-                    // Retail pumping — accumulate inventory aggressively, pull asks.
-                    (Some(optimal_bid), None)
-                }
-                MarketRegime::InstitutionalAbsorptionDown => {
-                    // Whales distributing — shadow bids, only offer asks to dump.
-                    (None, Some(optimal_ask))
-                }
-                MarketRegime::DeadZone => {
-                    // Thin/stale book — quote both sides; Risk Manager forces spread ≥ 20t.
-                    (Some(optimal_bid), Some(optimal_ask))
-                }
-                MarketRegime::ToxicLiquidationCascade => {
-                    // Hard stop — pull all quotes, panic-sell handled below.
-                    (None, None)
-                }
-            };
-
-            // 2. Inventory clamping overrides (hard safety, always enforced).
+            // Inventory clamping (regime no longer drives bid/ask sides).
             if self.inventory_coin >= max_inv {
-                // Long clamped: stop buying, force ask to dump.
                 (None, Some(optimal_ask))
             } else if self.inventory_coin <= -max_inv {
-                // Short clamped: stop selling, force bid to cover.
                 (Some(optimal_bid), None)
             } else {
-                (r_bid, r_ask)
+                (Some(optimal_bid), Some(optimal_ask))
             }
         };
 

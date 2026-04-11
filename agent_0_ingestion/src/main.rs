@@ -351,16 +351,18 @@ async fn order_manager(
             }
 
             // ── Panic stop-loss — MARKET SELL ─────────────────────────────────
-            OrderCmd::PanicSell { symbol, qty } => {
+            OrderCmd::PanicSell { symbol, qty: _ } => {
                 if let Some(s) = states.get_mut(&symbol) {
                     if let Some(id) = s.bid_id.take() { let _ = client.cancel_order(&symbol, id).await; }
                     if let Some(id) = s.ask_id.take() { let _ = client.cancel_order(&symbol, id).await; }
                     s.last_bid = 0.0; s.last_ask = 0.0;
 
-                    if qty >= s.lot_step {
-                        match client.place_market_sell(&symbol, qty, s.lot_step).await {
+                    // CRITICAL FIX: sell what we physically own per shadow ledger
+                    let sell_qty = (s.real_inventory / s.lot_step).floor() * s.lot_step;
+                    if sell_qty >= s.lot_step {
+                        match client.place_market_sell(&symbol, sell_qty, s.lot_step).await {
                             Ok(id) => {
-                                info!("[{}] PANIC SELL executed orderId={} qty={:.8}", symbol, id, qty);
+                                info!("[{}] PANIC SELL executed orderId={} qty={:.8}", symbol, id, sell_qty);
                                 last_bal_refresh = Instant::now()
                                     .checked_sub(Duration::from_secs(BALANCE_REFRESH_S + 1))
                                     .unwrap_or_else(Instant::now);
@@ -368,7 +370,7 @@ async fn order_manager(
                             Err(e) => error!("[{}] PANIC SELL failed: {}", symbol, e),
                         }
                     } else {
-                        warn!("[{}] PanicSell qty={:.8} too small — skipped", symbol, qty);
+                        warn!("[{}] PanicSell real_inventory={:.8} too small — skipped", symbol, s.real_inventory);
                     }
                 }
             }
@@ -411,15 +413,16 @@ async fn order_manager(
                     && s.last_requote.elapsed().as_millis() >= REQUOTE_MIN_MS
                 {
                     if let Some(id) = s.ask_id.take() { let _ = client.cancel_order(&symbol, id).await; }
-                    let coin_free = balances.get(&s.coin_asset).copied().unwrap_or(0.0);
-                    let qty = round_qty(coin_free, s.lot_step);
-                    if qty >= s.lot_step && qty * ask_price >= binance_rest::MIN_NOTIONAL {
-                        match client.place_limit_order(&symbol, "SELL", ask_price, qty, s.tick_size, s.lot_step).await {
+                    // CRITICAL FIX: sell what we physically own per shadow ledger
+                    let sell_qty = (s.real_inventory / s.lot_step).floor() * s.lot_step;
+                    let notional  = sell_qty * ask_price;
+                    if sell_qty >= s.lot_step && notional >= binance_rest::MIN_NOTIONAL {
+                        match client.place_limit_order(&symbol, "SELL", ask_price, sell_qty, s.tick_size, s.lot_step).await {
                             Ok(id) => { s.ask_id = Some(id); s.last_ask = ask_price; s.last_requote = Instant::now(); }
                             Err(e) => warn!("[{}] SkewAsk place skipped: {}", symbol, e),
                         }
                     } else {
-                        warn!("[{}] SkewAsk insufficient coin: free={:.8}", symbol, coin_free);
+                        warn!("[{}] SkewAsk insufficient inventory: real={:.8}", symbol, s.real_inventory);
                     }
                 }
             }
@@ -455,18 +458,19 @@ async fn order_manager(
                     }
                 }
 
-                // ASK side — dump full coin_free for aggressive ping-pong exit.
+                // ASK side — sell what we physically own per shadow ledger.
                 if ask_moved {
                     if let Some(id) = s.ask_id.take() { let _ = client.cancel_order(&symbol, id).await; }
-                    let coin_free = balances.get(&s.coin_asset).copied().unwrap_or(0.0);
-                    let qty = round_qty(coin_free, s.lot_step);
-                    if qty >= s.lot_step && qty * ask_price >= binance_rest::MIN_NOTIONAL {
-                        match client.place_limit_order(&symbol, "SELL", ask_price, qty, s.tick_size, s.lot_step).await {
+                    // CRITICAL FIX: sell what we physically own per shadow ledger
+                    let sell_qty = (s.real_inventory / s.lot_step).floor() * s.lot_step;
+                    let notional  = sell_qty * ask_price;
+                    if sell_qty >= s.lot_step && notional >= binance_rest::MIN_NOTIONAL {
+                        match client.place_limit_order(&symbol, "SELL", ask_price, sell_qty, s.tick_size, s.lot_step).await {
                             Ok(id) => { s.ask_id = Some(id); s.last_ask = ask_price; }
                             Err(e) => warn!("[{}] Requote ask skipped: {}", symbol, e),
                         }
                     } else {
-                        warn!("[{}] Requote ask insufficient coin: free={:.8}", symbol, coin_free);
+                        warn!("[{}] Requote ask insufficient inventory: real={:.8}", symbol, s.real_inventory);
                     }
                 }
 
