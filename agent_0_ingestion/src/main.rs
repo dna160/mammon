@@ -1004,11 +1004,16 @@ async fn main() -> Result<()> {
     let (fill_tx,  fill_rx)  = mpsc::channel::<FillNotif>(128);
     let (aq_tx,    aq_rx)    = mpsc::unbounded_channel::<AgentQUpdate>();
 
-    // ── User Data Stream (Binance WebSocket API) ──────────────────────────────
-    // Per docs: wss://ws-api.binance.com:443/ws-api/v3
-    //   1. Send userDataStream.start  (SIGNED) → receive listenKey
-    //   2. Send userDataStream.subscribe        → execution reports arrive on same conn
-    //   3. Send userDataStream.ping every 30min → keep listenKey alive
+    // ── User Data Stream (Phase 4 — full PRD implementation) ─────────────────
+    // PRD Phase 4 steps:
+    //   Step 1: REST POST /api/v3/userDataStream → listenKey (weight: 2)
+    //           Fallback: WebSocket API (wss://ws-api.binance.com) if REST is blocked
+    //   Step 2: WSS wss://stream.binance.com:9443/ws/<listenKey> → push stream
+    //           Fallback: WebSocket API subscribe on same connection if stream blocked
+    //   Step 3: Deserialize executionReport events (e == "executionReport")
+    //   Step 4: filled_qty → real_inventory via tokio::select! in order_manager
+    //
+    // Keepalive: REST PUT /api/v3/userDataStream every 30 min
     let (uds_tx, uds_rx) = mpsc::channel::<ExecutionReport>(1024);
     {
         let uds_client = Arc::clone(&binance_client);
@@ -1017,123 +1022,195 @@ async fn main() -> Result<()> {
             const WS_API_URL: &str = "wss://ws-api.binance.com:443/ws-api/v3";
 
             loop {
-                match connect_async(WS_API_URL).await {
-                    Err(e) => {
-                        warn!("[UDS] connect failed: {} — retrying in 5s…", e);
-                        sleep(Duration::from_secs(5)).await;
-                        continue;
+                // ══════════════════════════════════════════════════════════════
+                // Step 1: Obtain listenKey
+                //   Primary:  REST POST /api/v3/userDataStream
+                //   Fallback: WebSocket API userDataStream.start
+                // ══════════════════════════════════════════════════════════════
+                enum UdsMode { Stream(String), WsApi }
+
+                let mode = match uds_client.get_listen_key().await {
+                    Ok(k) => {
+                        info!("[UDS] listenKey obtained via REST (POST /api/v3/userDataStream).");
+                        UdsMode::Stream(k)
                     }
-                    Ok((ws_stream, _)) => {
-                        info!("[UDS] WebSocket API connected.");
-                        let (mut writer, mut reader) = ws_stream.split();
+                    Err(e) => {
+                        warn!("[UDS] REST get_listen_key unavailable: {} → falling back to WebSocket API.", e);
+                        UdsMode::WsApi
+                    }
+                };
 
-                        // ── Step 1: userDataStream.start (apiKey only — USER_STREAM auth)
-                        let start_req = serde_json::json!({
-                            "id":     "uds-start",
-                            "method": "userDataStream.start",
-                            "params": {
-                                "apiKey": uds_client.api_key()
-                            }
-                        }).to_string();
+                match mode {
+                    // ──────────────────────────────────────────────────────────
+                    // Step 2 PRIMARY: stream.binance.com:9443/ws/<listenKey>
+                    // ──────────────────────────────────────────────────────────
+                    UdsMode::Stream(listen_key) => {
+                        let stream_url = format!("wss://stream.binance.com:9443/ws/{}", listen_key);
+                        info!("[UDS] Connecting stream endpoint: wss://stream.binance.com:9443/ws/<key>");
 
-                        if let Err(e) = writer.send(Message::Text(start_req)).await {
-                            warn!("[UDS] send start failed: {} — retrying…", e);
-                            sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
-
-                        // Read response and extract listenKey
-                        let listen_key = {
-                            let mut key = None;
-                            while let Some(Ok(msg)) = reader.next().await {
-                                if let Message::Text(text) = msg {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if v["id"] == "uds-start" {
-                                            if v["status"] == 200 {
-                                                key = v["result"]["listenKey"]
-                                                    .as_str()
-                                                    .map(|s| s.to_string());
-                                            } else {
-                                                warn!("[UDS] userDataStream.start error: {}", text);
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            key
-                        };
-
-                        let listen_key = match listen_key {
-                            Some(k) => { info!("[UDS] listenKey obtained."); k }
-                            None    => {
-                                warn!("[UDS] Failed to get listenKey — retrying in 5s…");
+                        match connect_async(&stream_url).await {
+                            Err(e) => {
+                                warn!("[UDS] stream.binance.com connect failed: {} — retrying in 5s…", e);
                                 sleep(Duration::from_secs(5)).await;
                                 continue;
                             }
-                        };
+                            Ok((ws_stream, _)) => {
+                                info!("[UDS] stream.binance.com connected — listening for executionReports.");
+                                let (mut writer, mut reader) = ws_stream.split();
 
-                        // ── Step 2: userDataStream.subscribe ─────────────────
-                        let sub_req = serde_json::json!({
-                            "id":     "uds-subscribe",
-                            "method": "userDataStream.subscribe",
-                            "params": { "listenKey": &listen_key }
-                        }).to_string();
+                                // Step 3: Receive executionReports + REST keepalive every 30 min
+                                let mut keepalive_timer =
+                                    tokio::time::interval(Duration::from_secs(30 * 60));
+                                keepalive_timer.tick().await;
 
-                        if let Err(e) = writer.send(Message::Text(sub_req)).await {
-                            warn!("[UDS] send subscribe failed: {} — retrying…", e);
-                            sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
-                        info!("[UDS] User Data Stream subscribed — listening for fills.");
-
-                        // ── Step 3: Receive events + ping every 30 min ───────
-                        let mut ping_timer =
-                            tokio::time::interval(Duration::from_secs(30 * 60));
-                        ping_timer.tick().await; // discard the immediate first tick
-
-                        'recv: loop {
-                            tokio::select! {
-                                _ = ping_timer.tick() => {
-                                    let ping_req = serde_json::json!({
-                                        "id":     "uds-ping",
-                                        "method": "userDataStream.ping",
-                                        "params": { "listenKey": &listen_key }
-                                    }).to_string();
-                                    if let Err(e) = writer.send(Message::Text(ping_req)).await {
-                                        warn!("[UDS] ping failed: {} — reconnecting…", e);
-                                        break 'recv;
-                                    }
-                                    info!("[UDS] listenKey ping sent.");
-                                }
-
-                                msg = reader.next() => {
-                                    match msg {
-                                        Some(Ok(Message::Text(text))) => {
-                                            // API response frames (subscribe ack, ping ack) have "id" field — skip them.
-                                            if text.contains("\"id\"") { continue 'recv; }
-                                            // Execution report frames have "e" field.
-                                            if let Ok(report) = serde_json::from_str::<ExecutionReport>(&text) {
-                                                if report.event_type == "executionReport"
-                                                    && (report.order_status == "FILLED"
-                                                        || report.order_status == "PARTIALLY_FILLED")
-                                                {
-                                                    let _ = uds_tx.send(report).await;
+                                'stream: loop {
+                                    tokio::select! {
+                                        _ = keepalive_timer.tick() => {
+                                            // Keepalive: REST PUT /api/v3/userDataStream
+                                            match uds_client.keepalive_listen_key(&listen_key).await {
+                                                Ok(()) => info!("[UDS] listenKey keepalive OK (PUT /api/v3/userDataStream)."),
+                                                Err(e) => {
+                                                    warn!("[UDS] keepalive failed: {} — reconnecting…", e);
+                                                    break 'stream;
                                                 }
                                             }
                                         }
-                                        Some(Ok(Message::Ping(d))) => {
-                                            let _ = writer.send(Message::Pong(d)).await;
+                                        msg = reader.next() => {
+                                            match msg {
+                                                Some(Ok(Message::Text(text))) => {
+                                                    // Step 3: Deserialize executionReport
+                                                    if let Ok(report) = serde_json::from_str::<ExecutionReport>(&text) {
+                                                        if report.event_type == "executionReport"
+                                                            && (report.order_status == "FILLED"
+                                                                || report.order_status == "PARTIALLY_FILLED")
+                                                        {
+                                                            // Step 4: forward to order_manager → real_inventory
+                                                            let _ = uds_tx.send(report).await;
+                                                        }
+                                                    }
+                                                }
+                                                Some(Ok(Message::Ping(d))) => {
+                                                    let _ = writer.send(Message::Pong(d)).await;
+                                                }
+                                                Some(Ok(Message::Close(_))) | None => {
+                                                    warn!("[UDS] stream closed — reconnecting…");
+                                                    break 'stream;
+                                                }
+                                                Some(Err(e)) => {
+                                                    warn!("[UDS] stream error: {} — reconnecting…", e);
+                                                    break 'stream;
+                                                }
+                                                _ => {}
+                                            }
                                         }
-                                        Some(Ok(Message::Close(_))) | None => {
-                                            warn!("[UDS] Stream closed — reconnecting…");
-                                            break 'recv;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ──────────────────────────────────────────────────────────
+                    // Step 2 FALLBACK: WebSocket API (ws-api.binance.com)
+                    //   Used when REST endpoint is blocked by regional routing.
+                    //   userDataStream.start → listenKey, subscribe → events.
+                    // ──────────────────────────────────────────────────────────
+                    UdsMode::WsApi => {
+                        match connect_async(WS_API_URL).await {
+                            Err(e) => {
+                                warn!("[UDS] WS-API connect failed: {} — retrying in 5s…", e);
+                                sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Ok((ws_stream, _)) => {
+                                info!("[UDS] WebSocket API connected (fallback path).");
+                                let (mut writer, mut reader) = ws_stream.split();
+
+                                // Obtain listenKey via WS API
+                                let start_req = serde_json::json!({
+                                    "id": "uds-start", "method": "userDataStream.start",
+                                    "params": { "apiKey": uds_client.api_key() }
+                                }).to_string();
+                                if writer.send(Message::Text(start_req)).await.is_err() {
+                                    sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
+
+                                let listen_key = {
+                                    let mut key = None;
+                                    while let Some(Ok(Message::Text(text))) = reader.next().await {
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            if v["id"] == "uds-start" {
+                                                if v["status"] == 200 {
+                                                    key = v["result"]["listenKey"].as_str().map(String::from);
+                                                } else {
+                                                    warn!("[UDS] WS-API start error: {}", text);
+                                                }
+                                                break;
+                                            }
                                         }
-                                        Some(Err(e)) => {
-                                            warn!("[UDS] receive error: {} — reconnecting…", e);
-                                            break 'recv;
+                                    }
+                                    key
+                                };
+
+                                let listen_key = match listen_key {
+                                    Some(k) => { info!("[UDS] listenKey obtained via WebSocket API (fallback)."); k }
+                                    None => { sleep(Duration::from_secs(5)).await; continue; }
+                                };
+
+                                // Subscribe
+                                let sub_req = serde_json::json!({
+                                    "id": "uds-subscribe", "method": "userDataStream.subscribe",
+                                    "params": { "listenKey": &listen_key }
+                                }).to_string();
+                                if writer.send(Message::Text(sub_req)).await.is_err() {
+                                    sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                                info!("[UDS] WebSocket API subscribed — listening for executionReports.");
+
+                                let mut ping_timer =
+                                    tokio::time::interval(Duration::from_secs(30 * 60));
+                                ping_timer.tick().await;
+
+                                'wsapi: loop {
+                                    tokio::select! {
+                                        _ = ping_timer.tick() => {
+                                            let ping_req = serde_json::json!({
+                                                "id": "uds-ping", "method": "userDataStream.ping",
+                                                "params": { "listenKey": &listen_key }
+                                            }).to_string();
+                                            if writer.send(Message::Text(ping_req)).await.is_err() {
+                                                break 'wsapi;
+                                            }
+                                            info!("[UDS] WS-API ping sent.");
                                         }
-                                        _ => {}
+                                        msg = reader.next() => {
+                                            match msg {
+                                                Some(Ok(Message::Text(text))) => {
+                                                    if text.contains("\"id\"") { continue 'wsapi; }
+                                                    // Step 3: Deserialize executionReport
+                                                    if let Ok(report) = serde_json::from_str::<ExecutionReport>(&text) {
+                                                        if report.event_type == "executionReport"
+                                                            && (report.order_status == "FILLED"
+                                                                || report.order_status == "PARTIALLY_FILLED")
+                                                        {
+                                                            // Step 4: forward to order_manager → real_inventory
+                                                            let _ = uds_tx.send(report).await;
+                                                        }
+                                                    }
+                                                }
+                                                Some(Ok(Message::Ping(d))) => { let _ = writer.send(Message::Pong(d)).await; }
+                                                Some(Ok(Message::Close(_))) | None => {
+                                                    warn!("[UDS] WS-API stream closed — reconnecting…");
+                                                    break 'wsapi;
+                                                }
+                                                Some(Err(e)) => {
+                                                    warn!("[UDS] WS-API error: {} — reconnecting…", e);
+                                                    break 'wsapi;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1143,7 +1220,7 @@ async fn main() -> Result<()> {
                 sleep(Duration::from_secs(5)).await;
             }
         });
-        info!("[UDS] User Data Stream task spawned.");
+        info!("[UDS] User Data Stream task spawned (REST+stream primary / WS-API fallback).");
     }
 
     {

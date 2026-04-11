@@ -100,6 +100,53 @@ impl BinanceClient {
         &self.api_key
     }
 
+    // ── User Data Stream (REST management) ───────────────────────────────────
+
+    /// Phase 4 Step 1 — POST /api/v3/userDataStream
+    /// Creates a listenKey for the User Data Stream (weight: 2).
+    /// The listenKey is then used to connect to:
+    ///   wss://stream.binance.com:9443/ws/<listenKey>
+    pub async fn get_listen_key(&self) -> Result<String> {
+        let url = format!("{}/api/v3/userDataStream", BASE_URL);
+        let http_resp = self.http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await
+            .context("get_listen_key: network error")?;
+
+        let status = http_resp.status();
+        let body   = http_resp.text().await.unwrap_or_default();
+
+        let resp: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!(
+                "get_listen_key: non-JSON response (HTTP {}): {} — body: {}",
+                status, e, &body[..body.len().min(200)]
+            ))?;
+
+        resp["listenKey"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("get_listen_key: missing listenKey in response: {}", resp))
+    }
+
+    /// Phase 4 Step 3 (keepalive) — PUT /api/v3/userDataStream
+    /// Extends the listenKey validity by 60 minutes. Call every ~30 minutes.
+    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<()> {
+        let url = format!("{}/api/v3/userDataStream?listenKey={}", BASE_URL, listen_key);
+        let resp = self.http
+            .put(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await
+            .context("keepalive_listen_key: network error")?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!("keepalive_listen_key failed: {}", body))
+        }
+    }
+
     // ── Account ───────────────────────────────────────────────────────────────
 
     /// Fetch all non-zero spot balances.
