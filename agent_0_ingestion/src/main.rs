@@ -23,7 +23,7 @@ mod engine_d_hft;
 use anyhow::Result;
 use binance_rest::{qty_from_fixed_notional, round_price, round_qty, BinanceClient};
 use engine_d_hft::{HFTEngine, MarketRegime};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -273,63 +273,48 @@ async fn order_manager(
 
         tokio::select! {
 
-            // ── UDS execution report ──────────────────────────────────────────
-            Some(rpt) = uds_rx.recv() => {
-                if rpt.event_type != "executionReport" { continue; }
-                if rpt.order_status != "FILLED" && rpt.order_status != "PARTIALLY_FILLED" { continue; }
+            // ── HANDLE INSTANT ZERO-LATENCY FILLS (UDS execution report) ─────
+            Some(report) = uds_rx.recv() => {
+                let symbol = report.symbol.clone();
+                if let Some(s) = states.get_mut(&symbol) {
+                    let filled_qty:   f64 = report.last_filled_qty.parse().unwrap_or(0.0);
+                    let filled_price: f64 = report.last_filled_price.parse().unwrap_or(0.0);
+                    let fee:          f64 = report.commission.parse().unwrap_or(0.0);
+                    let is_buyer = report.side == "BUY";
+                    let notional = filled_price * filled_qty;
 
-                let symbol  = &rpt.symbol;
-                let qty:  f64 = rpt.last_qty.parse().unwrap_or(0.0);
-                let price:f64 = rpt.last_price.parse().unwrap_or(0.0);
-                if qty <= 0.0 || price <= 0.0 { continue; }
-                let is_buyer = rpt.side == "BUY";
-                let notional = qty * price;
-
-                // Estimate fee in USD: if fee is in FDUSD/USD-pegged asset use directly,
-                // otherwise approximate via fee_qty * price.
-                let fee_raw: f64 = rpt.fee_qty.parse().unwrap_or(0.0);
-                let fee_usd = if rpt.fee_asset.as_deref().map_or(false, |a| a.ends_with("USD") || a == "FDUSD") {
-                    fee_raw
-                } else {
-                    fee_raw * price
-                };
-
-                if let Some(s) = states.get_mut(symbol) {
-                    if rpt.trade_id > 0 && rpt.trade_id as u64 > s.last_trade_id {
-                        s.last_trade_id = rpt.trade_id as u64;
-                    }
+                    // Update Shadow Ledger instantly
                     if is_buyer {
-                        s.real_inventory += qty;
-                        s.real_pnl_usd   -= notional + fee_usd;
+                        s.real_inventory += filled_qty;
+                        s.real_pnl_usd   -= notional + fee;
                     } else {
-                        s.real_inventory -= qty;
-                        s.real_pnl_usd   += notional - fee_usd;
+                        s.real_inventory -= filled_qty;
+                        s.real_pnl_usd   += notional - fee;
                     }
                     s.real_total_trades += 1;
+                    if report.trade_id > 0 {
+                        s.last_trade_id = report.trade_id as u64;
+                    }
 
-                    let _ = fill_tx.try_send((symbol.clone(), is_buyer, price, qty, fee_usd));
-                    last_bal_refresh = Instant::now()
-                        .checked_sub(Duration::from_secs(BALANCE_REFRESH_S + 1))
-                        .unwrap_or_else(Instant::now);
+                    // Alert main loop to update engine math
+                    let _ = fill_tx.try_send((symbol.clone(), is_buyer, filled_price, filled_qty, fee));
 
+                    info!(
+                        "[{}][UDS FILL] {} {:.8} @ {:.8} | pnl={:.2} | inv={:+.8}",
+                        symbol, report.side, filled_qty, filled_price,
+                        s.real_pnl_usd, s.real_inventory
+                    );
+
+                    // Log to Redis & Postgres
                     let fp = format!(
                         r#"{{"ts":{},"tradeId":{},"orderId":{},"side":"{}","price":{:.8},"qty":{:.8},"notional":{:.4},"fee":{:.4},"pnl_running":{:.2},"inventory":{:.8},"total_trades":{}}}"#,
-                        rpt.transact_ms, rpt.trade_id, rpt.order_id,
-                        if is_buyer { "BUY" } else { "SELL" },
-                        price, qty, notional, fee_usd,
+                        millis_now(), report.trade_id, report.order_id, report.side,
+                        filled_price, filled_qty, notional, fee,
                         s.real_pnl_usd, s.real_inventory, s.real_total_trades
                     );
                     let key = format!("engine_d:{}:last_fill", symbol);
                     let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
-                    spawn_telemetry_insert(Arc::clone(&db), symbol.clone(), notional, is_buyer, fee_usd);
-
-                    info!(
-                        "[{}][UDS fill] orderId={} {} {:.8} @ {:.8}  notional={:.4}  fee={:.4}  pnl={:.2}  inv={:+.8}",
-                        symbol, rpt.order_id,
-                        if is_buyer { "BUY " } else { "SELL" },
-                        qty, price, notional, fee_usd,
-                        s.real_pnl_usd, s.real_inventory
-                    );
+                    spawn_telemetry_insert(Arc::clone(&db), symbol, notional, is_buyer, fee);
                 }
                 continue;
             }
@@ -541,21 +526,22 @@ impl DepthBook {
 
 // ── User Data Stream execution report ─────────────────────────────────────────
 
-/// Inbound `executionReport` event from the Binance User Data Stream.
-/// Only `FILLED` and `PARTIALLY_FILLED` events are acted upon by order_manager.
+/// Inbound `executionReport` event from the Tokocrypto User Data Stream.
+/// Only `FILLED` and `PARTIALLY_FILLED` events with `x = "TRADE"` are acted upon.
 #[derive(Debug, Deserialize, Clone)]
 struct ExecutionReport {
-    #[serde(rename = "e")] event_type:    String,   // "executionReport"
-    #[serde(rename = "s")] symbol:        String,   // "ADAFDUSD"
-    #[serde(rename = "S")] side:          String,   // "BUY" | "SELL"
-    #[serde(rename = "X")] order_status:  String,   // "FILLED" | "PARTIALLY_FILLED" | …
-    #[serde(rename = "l")] last_qty:      String,   // last executed qty (coin)
-    #[serde(rename = "L")] last_price:    String,   // last executed price
-    #[serde(rename = "n")] fee_qty:       String,   // commission amount
-    #[serde(rename = "N")] fee_asset:     Option<String>, // commission asset (may be null)
-    #[serde(rename = "T")] transact_ms:   u64,      // transaction time (ms epoch)
-    #[serde(rename = "i")] order_id:      u64,      // order ID
-    #[serde(rename = "t")] trade_id:      i64,      // trade ID (-1 if no fill yet)
+    #[serde(rename = "e")] event_type:             String,  // "executionReport"
+    #[serde(rename = "s")] symbol:                 String,  // "ADAFDUSD"
+    #[serde(rename = "S")] side:                   String,  // "BUY" | "SELL"
+    #[serde(rename = "x")] current_execution_type: String,  // "TRADE"
+    #[serde(rename = "X")] order_status:           String,  // "FILLED" | "PARTIALLY_FILLED"
+    #[serde(rename = "q")] order_qty:              String,
+    #[serde(rename = "p")] order_price:            String,
+    #[serde(rename = "l")] last_filled_qty:        String,  // last executed qty (coin)
+    #[serde(rename = "L")] last_filled_price:      String,  // last executed price
+    #[serde(rename = "n")] commission:             String,  // fee amount
+    #[serde(rename = "t")] trade_id:               i64,     // trade ID (-1 if no fill yet)
+    #[serde(rename = "i")] order_id:               i64,     // order ID
 }
 
 // ── Serde models ──────────────────────────────────────────────────────────────
@@ -1014,87 +1000,143 @@ async fn main() -> Result<()> {
     let (fill_tx,  fill_rx)  = mpsc::channel::<FillNotif>(128);
     let (aq_tx,    aq_rx)    = mpsc::unbounded_channel::<AgentQUpdate>();
 
-    // ── User Data Stream ──────────────────────────────────────────────────────
-    // Opens wss://stream.binance.com:9443/ws/{listenKey}.
-    // Pushes executionReport events into uds_tx for zero-latency fill processing.
+    // ── User Data Stream (Binance WebSocket API) ──────────────────────────────
+    // Per docs: wss://ws-api.binance.com:443/ws-api/v3
+    //   1. Send userDataStream.start  (SIGNED) → receive listenKey
+    //   2. Send userDataStream.subscribe        → execution reports arrive on same conn
+    //   3. Send userDataStream.ping every 30min → keep listenKey alive
     let (uds_tx, uds_rx) = mpsc::channel::<ExecutionReport>(1024);
-
     {
-        let uds_client = std::sync::Arc::clone(&binance_client);
-        let uds_tx2    = uds_tx.clone();
+        let uds_client = Arc::clone(&binance_client);
 
         tokio::spawn(async move {
-            // Fetch initial listenKey.
-            let mut listen_key = loop {
-                match uds_client.get_listen_key().await {
-                    Ok(k)  => { info!("[UDS] listenKey obtained."); break k; }
-                    Err(e) => {
-                        warn!("[UDS] get_listen_key failed: {}. Retry in 5s…", e);
-                        sleep(Duration::from_secs(5)).await;
-                    }
-                }
-            };
+            const WS_API_URL: &str = "wss://ws-api.binance.com:443/ws-api/v3";
 
-            // Keepalive: refresh every 30 minutes.
-            let keepalive_client = uds_client.clone();
-            let ka_key           = listen_key.clone();
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(30 * 60)).await;
-                    match keepalive_client.keepalive_listen_key(&ka_key).await {
-                        Ok(())  => info!("[UDS] listenKey keepalive OK."),
-                        Err(e)  => warn!("[UDS] listenKey keepalive failed: {}", e),
-                    }
-                }
-            });
-
-            // WebSocket listener loop — reconnects on drop/error.
             loop {
-                let wss = format!("wss://stream.binance.com:9443/ws/{}", listen_key);
-                info!("[UDS] Connecting to User Data Stream…");
-                let url = match url::Url::parse(&wss) {
-                    Ok(u)  => u,
-                    Err(e) => { warn!("[UDS] URL parse error: {}", e); sleep(Duration::from_secs(5)).await; continue; }
-                };
-                match connect_async(url).await {
+                match connect_async(WS_API_URL).await {
+                    Err(e) => {
+                        warn!("[UDS] connect failed: {} — retrying in 5s…", e);
+                        sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
                     Ok((ws_stream, _)) => {
-                        info!("[UDS] User Data Stream connected.");
-                        let (_, mut reader) = ws_stream.split();
-                        while let Some(msg) = reader.next().await {
-                            let text = match msg {
-                                Ok(Message::Text(t))  => t,
-                                Ok(Message::Ping(_))
-                                | Ok(Message::Pong(_))
-                                | Ok(Message::Frame(_)) => continue,
-                                Ok(Message::Close(f)) => {
-                                    info!("[UDS] Server closed stream: {:?}", f);
-                                    break;
+                        info!("[UDS] WebSocket API connected.");
+                        let (mut writer, mut reader) = ws_stream.split();
+
+                        // ── Step 1: userDataStream.start (apiKey only — USER_STREAM auth)
+                        let start_req = serde_json::json!({
+                            "id":     "uds-start",
+                            "method": "userDataStream.start",
+                            "params": {
+                                "apiKey": uds_client.api_key()
+                            }
+                        }).to_string();
+
+                        if let Err(e) = writer.send(Message::Text(start_req)).await {
+                            warn!("[UDS] send start failed: {} — retrying…", e);
+                            sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+
+                        // Read response and extract listenKey
+                        let listen_key = {
+                            let mut key = None;
+                            while let Some(Ok(msg)) = reader.next().await {
+                                if let Message::Text(text) = msg {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                        if v["id"] == "uds-start" {
+                                            if v["status"] == 200 {
+                                                key = v["result"]["listenKey"]
+                                                    .as_str()
+                                                    .map(|s| s.to_string());
+                                            } else {
+                                                warn!("[UDS] userDataStream.start error: {}", text);
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
-                                Ok(Message::Binary(_)) => continue,
-                                Err(e) => { warn!("[UDS] Receive error: {}", e); break; }
-                            };
-                            match serde_json::from_str::<ExecutionReport>(&text) {
-                                Ok(rpt) if rpt.event_type == "executionReport"
-                                    && (rpt.order_status == "FILLED" || rpt.order_status == "PARTIALLY_FILLED") =>
-                                {
-                                    let _ = uds_tx2.try_send(rpt);
+                            }
+                            key
+                        };
+
+                        let listen_key = match listen_key {
+                            Some(k) => { info!("[UDS] listenKey obtained."); k }
+                            None    => {
+                                warn!("[UDS] Failed to get listenKey — retrying in 5s…");
+                                sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+
+                        // ── Step 2: userDataStream.subscribe ─────────────────
+                        let sub_req = serde_json::json!({
+                            "id":     "uds-subscribe",
+                            "method": "userDataStream.subscribe",
+                            "params": { "listenKey": &listen_key }
+                        }).to_string();
+
+                        if let Err(e) = writer.send(Message::Text(sub_req)).await {
+                            warn!("[UDS] send subscribe failed: {} — retrying…", e);
+                            sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        info!("[UDS] User Data Stream subscribed — listening for fills.");
+
+                        // ── Step 3: Receive events + ping every 30 min ───────
+                        let mut ping_timer =
+                            tokio::time::interval(Duration::from_secs(30 * 60));
+                        ping_timer.tick().await; // discard the immediate first tick
+
+                        'recv: loop {
+                            tokio::select! {
+                                _ = ping_timer.tick() => {
+                                    let ping_req = serde_json::json!({
+                                        "id":     "uds-ping",
+                                        "method": "userDataStream.ping",
+                                        "params": { "listenKey": &listen_key }
+                                    }).to_string();
+                                    if let Err(e) = writer.send(Message::Text(ping_req)).await {
+                                        warn!("[UDS] ping failed: {} — reconnecting…", e);
+                                        break 'recv;
+                                    }
+                                    info!("[UDS] listenKey ping sent.");
                                 }
-                                Ok(_)   => {}  // outboundAccountPosition, balanceUpdate, etc.
-                                Err(_)  => {}  // non-executionReport JSON — ignore
+
+                                msg = reader.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Text(text))) => {
+                                            // API response frames (subscribe ack, ping ack) have "id" field — skip them.
+                                            if text.contains("\"id\"") { continue 'recv; }
+                                            // Execution report frames have "e" field.
+                                            if let Ok(report) = serde_json::from_str::<ExecutionReport>(&text) {
+                                                if report.event_type == "executionReport"
+                                                    && (report.order_status == "FILLED"
+                                                        || report.order_status == "PARTIALLY_FILLED")
+                                                {
+                                                    let _ = uds_tx.send(report).await;
+                                                }
+                                            }
+                                        }
+                                        Some(Ok(Message::Ping(d))) => {
+                                            let _ = writer.send(Message::Pong(d)).await;
+                                        }
+                                        Some(Ok(Message::Close(_))) | None => {
+                                            warn!("[UDS] Stream closed — reconnecting…");
+                                            break 'recv;
+                                        }
+                                        Some(Err(e)) => {
+                                            warn!("[UDS] receive error: {} — reconnecting…", e);
+                                            break 'recv;
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
-                        warn!("[UDS] Stream loop ended — reconnecting in 3s…");
-                    }
-                    Err(e) => {
-                        warn!("[UDS] connect_async failed: {}. Fetching new listenKey…", e);
-                        // Refresh listenKey on reconnect.
-                        match uds_client.get_listen_key().await {
-                            Ok(k)  => { listen_key = k; info!("[UDS] New listenKey obtained."); }
-                            Err(e2) => warn!("[UDS] get_listen_key retry failed: {}", e2),
-                        }
                     }
                 }
-                sleep(Duration::from_secs(3)).await;
+                sleep(Duration::from_secs(5)).await;
             }
         });
         info!("[UDS] User Data Stream task spawned.");

@@ -89,6 +89,16 @@ impl BinanceClient {
         format!("{}&signature={}", params, self.sign(params))
     }
 
+    /// Public signing helper — used by the UDS WebSocket task in main.rs.
+    pub fn sign_params(&self, params: &str) -> String {
+        self.sign(params)
+    }
+
+    /// Returns the API key — used by the UDS WebSocket task in main.rs.
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     // ── Account ───────────────────────────────────────────────────────────────
 
     /// Fetch all non-zero spot balances.
@@ -391,45 +401,6 @@ impl BinanceClient {
         Ok(fills)
     }
 
-    // ── User Data Stream ──────────────────────────────────────────────────────
-
-    /// Create a new listenKey for the User Data Stream.  Cost: 2 weight.
-    /// Must be refreshed every 30 minutes via `keepalive_listen_key`.
-    pub async fn get_listen_key(&self) -> Result<String> {
-        let url = format!("{}/api/v3/userDataStream", BASE_URL);
-        let response = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .header("Content-Length", "0")
-            .send()
-            .await
-            .context("POST /api/v3/userDataStream failed")?;
-        let status = response.status();
-        let raw = response.text().await.context("listenKey body read failed")?;
-        let resp: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("listenKey JSON parse failed (status={} body={})", status, &raw[..raw.len().min(200)]))?;
-        resp["listenKey"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("No listenKey in response (status={} body={})", status, &raw[..raw.len().min(200)]))
-    }
-
-    /// Extend the validity of an existing listenKey by 60 minutes.
-    /// Must be called every ≤30 minutes to keep the stream alive.
-    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v3/userDataStream?listenKey={}",
-            BASE_URL, listen_key
-        );
-        self.http
-            .put(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("PUT /api/v3/userDataStream keepalive failed")?;
-        Ok(())
-    }
 }
 
 // ── Pure utility functions ────────────────────────────────────────────────────
