@@ -245,12 +245,23 @@ async fn order_manager(
         }
     }
 
-    // Initial balance fetch.
+    // Initial balance fetch — seeds real_inventory AND engine.inventory_coin from
+    // free+locked ground truth to survive container restarts (Inventory Amnesia fix).
     match client.get_balances().await {
         Ok(b) => {
             info!("[OrderMgr] Initial balances: FDUSD={:.2}", b.get("FDUSD").copied().unwrap_or(0.0));
             for cfg in COIN_CONFIGS {
-                info!("  {} free={:.8}", cfg.coin_asset, b.get(cfg.coin_asset).copied().unwrap_or(0.0));
+                let total = b.get(cfg.coin_asset).copied().unwrap_or(0.0);
+                info!("  {} total(free+locked)={:.8}", cfg.coin_asset, total);
+                if let Some(s) = states.get_mut(cfg.symbol) {
+                    s.real_inventory = total;
+                    if total > 0.0 {
+                        info!("[{}] Shadow ledger seeded from balance: {:.8}", cfg.symbol, total);
+                        // Send synthetic seed fill (price=0 → no PnL impact) so
+                        // eng.inventory_coin in the tick loop also starts correct.
+                        let _ = fill_tx.try_send((cfg.symbol.to_string(), true, 0.0, total, 0.0));
+                    }
+                }
             }
             balances = b;
             last_bal_refresh = Instant::now();
@@ -260,14 +271,28 @@ async fn order_manager(
 
     // ── Main receive loop (tokio::select! multiplexes OrderCmd + UDS fills) ───
     loop {
-        // Refresh balances if stale (shared across all coins).
+        // Refresh balances if stale — also reconciles real_inventory from exchange ground truth.
         if last_bal_refresh.elapsed().as_secs() >= BALANCE_REFRESH_S {
             match client.get_balances().await {
                 Ok(b) => {
+                    let fdusd = b.get("FDUSD").copied().unwrap_or(0.0);
+                    info!("[OrderMgr] Balance refresh — FDUSD={:.2}", fdusd);
+                    // AMNESIA FIX: reconcile shadow ledger with free+locked ground truth.
+                    // Protects against drift between UDS deltas and exchange reality.
+                    for cfg in COIN_CONFIGS {
+                        let total = b.get(cfg.coin_asset).copied().unwrap_or(0.0);
+                        if let Some(s) = states.get_mut(cfg.symbol) {
+                            if (s.real_inventory - total).abs() > cfg.lot_step {
+                                info!(
+                                    "[{}] Inventory reconciled: shadow={:.8} → exchange={:.8}",
+                                    cfg.symbol, s.real_inventory, total
+                                );
+                                s.real_inventory = total;
+                            }
+                        }
+                    }
                     balances = b;
                     last_bal_refresh = Instant::now();
-                    let fdusd = balances.get("FDUSD").copied().unwrap_or(0.0);
-                    info!("[OrderMgr] Balance refresh — FDUSD={:.2}", fdusd);
                 }
                 Err(e) => error!("[OrderMgr] balance refresh error: {}", e),
             }

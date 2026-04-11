@@ -173,12 +173,17 @@ impl BinanceClient {
             .as_array()
             .ok_or_else(|| anyhow!("missing balances array"))?;
 
+        // AMNESIA FIX: sum free + locked so assets sitting in open SELL orders
+        // are counted — Binance moves coins to "locked" the moment a limit ask
+        // is placed, which was causing the shadow-ledger to read 0 and spam bids.
         let mut map = HashMap::new();
         for b in balances {
             let asset = b["asset"].as_str().unwrap_or("").to_string();
-            let free: f64 = b["free"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-            if free > 0.0 || asset == "FDUSD" {
-                map.insert(asset, free);
+            let free:   f64 = b["free"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+            let locked: f64 = b["locked"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+            let total = free + locked;
+            if total > 0.0 || asset == "FDUSD" {
+                map.insert(asset, total);
             }
         }
         Ok(map)

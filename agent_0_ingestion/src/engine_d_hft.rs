@@ -303,35 +303,29 @@ impl HFTEngine {
         let optimal_bid = snap(reservation_price - spread_delta);
         let optimal_ask = snap(reservation_price + spread_delta);
 
-        // ── Execution: TFI Shield → Spot Bias → Inventory Clamping ──────────
-        let warmed  = self.warm_ticks >= 20;
-        let max_inv = self.max_inventory_coin;
+        // ── Execution: TFI Shield → Strict Ping-Pong ─────────────────────────
+        let warmed = self.warm_ticks >= 20;
 
-        let (open_bid, open_ask) = if !warmed {
+        if !warmed {
             // Gate: not enough ticks to trust variance estimate.
-            (None, None)
+            self.open_bid = None;
+            self.open_ask = None;
         } else if tfi.abs() > self.live_tfi_threshold {
-            // TFI Toxic Shield: outermost guard — pull ALL quotes regardless of
-            // inventory state. Spot Bias must NOT bypass this (gridlock fix).
-            (None, None)
-        } else if self.inventory_coin < self.lot_step {
-            // Spot Bias: Zero-Inventory Aggressive Acquisition Mode.
-            // Only reachable when market is safe (TFI shield passed above).
-            let aggressive_spread = spread_delta * 0.8;
-            (Some(snap(reservation_price - aggressive_spread)), None)
+            // TFI Toxic Flow Shield — outermost guard, overrides everything.
+            self.open_bid = None;
+            self.open_ask = None;
+        } else if self.inventory_coin >= self.lot_step {
+            // STRICT EXIT MODE: we hold ≥1 lot — only sell, never buy.
+            // Prevents multi-tranche accumulation and inventory amnesia loops.
+            self.open_bid = None;
+            self.open_ask = Some(optimal_ask);
         } else {
-            // Inventory clamping (regime no longer drives bid/ask sides).
-            if self.inventory_coin >= max_inv {
-                (None, Some(optimal_ask))
-            } else if self.inventory_coin <= -max_inv {
-                (Some(optimal_bid), None)
-            } else {
-                (Some(optimal_bid), Some(optimal_ask))
-            }
-        };
-
-        self.open_bid = open_bid;
-        self.open_ask = open_ask;
+            // STRICT ACQUISITION MODE: we are flat — only buy, never sell.
+            let aggressive_spread = spread_delta * 0.8; // 20% tighter to ensure fill
+            let bid_price = reservation_price - aggressive_spread;
+            self.open_bid = Some((bid_price / self.tick_size).round() * self.tick_size);
+            self.open_ask = None;
+        }
 
         // ── Panic Stop-Loss ───────────────────────────────────────────────────
         // Triggers on: (a) price drawdown below last fill, or
@@ -350,8 +344,8 @@ impl HFTEngine {
             reservation_price,
             optimal_bid,
             optimal_ask,
-            open_bid,
-            open_ask,
+            open_bid:          self.open_bid,
+            open_ask:          self.open_ask,
             inventory_coin:    self.inventory_coin,
             pnl_usd:           self.pnl_usd,
             total_trades:      self.total_trades,
