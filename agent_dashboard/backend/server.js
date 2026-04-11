@@ -1,6 +1,6 @@
 /**
  * Mammon Dashboard Backend
- * Express REST API — serves trade telemetry from PostgreSQL to the React frontend.
+ * Express REST API — serves Engine D trade telemetry from PostgreSQL to the React frontend.
  */
 
 const express = require('express');
@@ -36,37 +36,27 @@ app.get('/health', (_req, res) => {
 });
 
 // ── GET /api/kpis ─────────────────────────────────────────────────────────────
-// Returns daily trade count and cumulative ROE% per engine (24h window).
-// Response: { A: { daily_trades: N, daily_roe: X }, B: {...}, C: {...} }
+// Returns daily trade count and cumulative ROE% for Engine D (24h window).
+// Response: { D: { daily_trades: N, daily_roe: X } }
 
 app.get('/api/kpis', async (_req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        engine_id,
-        COUNT(*)::int             AS daily_trades,
+        COUNT(*)::int                    AS daily_trades,
         COALESCE(SUM(trade_roe_pct), 0) AS daily_roe
       FROM trade_telemetry
-      WHERE timestamp > NOW() - INTERVAL '24 hours'
-      GROUP BY engine_id
+      WHERE engine_id = 'D'
+        AND timestamp > NOW() - INTERVAL '24 hours'
     `);
 
-    const kpis = {
-      A: { daily_trades: 0, daily_roe: 0 },
-      B: { daily_trades: 0, daily_roe: 0 },
-      C: { daily_trades: 0, daily_roe: 0 },
-    };
-
-    for (const row of result.rows) {
-      if (Object.prototype.hasOwnProperty.call(kpis, row.engine_id)) {
-        kpis[row.engine_id] = {
-          daily_trades: row.daily_trades,
-          daily_roe:    parseFloat(row.daily_roe),
-        };
-      }
-    }
-
-    res.json(kpis);
+    const row = result.rows[0] || { daily_trades: 0, daily_roe: 0 };
+    res.json({
+      D: {
+        daily_trades: row.daily_trades,
+        daily_roe:    parseFloat(row.daily_roe),
+      },
+    });
   } catch (err) {
     console.error('KPIs query error:', err.message);
     res.status(500).json({ error: 'Database error' });
@@ -74,7 +64,7 @@ app.get('/api/kpis', async (_req, res) => {
 });
 
 // ── GET /api/trades ───────────────────────────────────────────────────────────
-// Returns latest 50 trade records, newest first.
+// Returns latest 50 Engine D trade records across all Binance pairs, newest first.
 
 app.get('/api/trades', async (_req, res) => {
   try {
@@ -91,7 +81,7 @@ app.get('/api/trades', async (_req, res) => {
         net_pnl,
         trade_roe_pct
       FROM trade_telemetry
-      WHERE asset_pair = 'BTC_IDR'
+      WHERE engine_id = 'D'
       ORDER BY timestamp DESC
       LIMIT 50
     `);
@@ -103,36 +93,30 @@ app.get('/api/trades', async (_req, res) => {
 });
 
 // ── GET /api/chart ────────────────────────────────────────────────────────────
-// Returns cumulative ROE% over time, pivoted for Recharts.
-// Response: [{ time: ISO, A: cumROE, B: cumROE, C: cumROE }, ...]
+// Returns cumulative ROE% over time for Engine D.
+// Response: [{ time: ISO, D: cumROE }, ...]
 
 app.get('/api/chart', async (_req, res) => {
   try {
     const result = await pool.query(`
       SELECT
         date_trunc('minute', timestamp) AS bucket,
-        engine_id,
         SUM(trade_roe_pct) OVER (
-          PARTITION BY engine_id
           ORDER BY date_trunc('minute', timestamp)
           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS cumulative_roe
       FROM trade_telemetry
-      WHERE timestamp > NOW() - INTERVAL '24 hours'
+      WHERE engine_id = 'D'
+        AND timestamp > NOW() - INTERVAL '24 hours'
       ORDER BY bucket ASC
     `);
 
-    // Pivot: { "2024-01-01T00:00Z": { A: x, B: y, C: z } }
-    const pivot = {};
-    for (const row of result.rows) {
-      const key = row.bucket.toISOString();
-      if (!pivot[key]) pivot[key] = { time: key, A: 0, B: 0, C: 0 };
-      if (Object.prototype.hasOwnProperty.call(pivot[key], row.engine_id)) {
-        pivot[key][row.engine_id] = parseFloat(row.cumulative_roe);
-      }
-    }
+    const chartData = result.rows.map((row) => ({
+      time: row.bucket.toISOString(),
+      D:    parseFloat(row.cumulative_roe),
+    }));
 
-    res.json(Object.values(pivot));
+    res.json(chartData);
   } catch (err) {
     console.error('Chart query error:', err.message);
     res.status(500).json({ error: 'Database error' });

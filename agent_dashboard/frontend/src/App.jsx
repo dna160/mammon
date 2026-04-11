@@ -1,51 +1,40 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Legend,
+  ResponsiveContainer, ReferenceLine,
 } from 'recharts';
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
-const ENGINE_COLORS = { A: '#F97316', B: '#A78BFA', C: '#34D399' };
-const ENGINE_LABELS = { A: 'Spatial Arb', B: 'Stat Arb', C: 'Microstructure' };
-const ENGINE_BG     = {
-  A: 'rgba(249,115,22,0.08)',
-  B: 'rgba(167,139,250,0.08)',
-  C: 'rgba(52,211,153,0.08)',
-};
-const ENGINE_BORDER = {
-  A: 'rgba(249,115,22,0.3)',
-  B: 'rgba(167,139,250,0.3)',
-  C: 'rgba(52,211,153,0.3)',
-};
+const D_COLOR  = '#58A6FF';
+const D_BG     = 'rgba(88,166,255,0.08)';
+const D_BORDER = 'rgba(88,166,255,0.3)';
 
 // ── KPI Card ──────────────────────────────────────────────────────────────────
 
-function KpiCard({ engine, data }) {
-  const color  = ENGINE_COLORS[engine];
-  const label  = ENGINE_LABELS[engine];
+function KpiCard({ data }) {
   const roe    = parseFloat(data?.daily_roe ?? 0);
   const trades = data?.daily_trades ?? 0;
 
   return (
     <div
       className="flex-1 min-w-[220px] rounded-lg p-5 border transition-all"
-      style={{ background: ENGINE_BG[engine], borderColor: ENGINE_BORDER[engine] }}
+      style={{ background: D_BG, borderColor: D_BORDER }}
     >
       <div className="flex items-center justify-between mb-3">
         <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: '#8B949E' }}>
-          Engine {engine}
+          Engine D
         </span>
         <span
           className="text-xs font-bold px-2 py-0.5 rounded-full"
-          style={{ background: `${color}22`, color }}
+          style={{ background: `${D_COLOR}22`, color: D_COLOR }}
         >
-          {label}
+          HFT Market Maker
         </span>
       </div>
       <div className="flex items-end gap-6">
         <div>
-          <div className="text-3xl font-bold" style={{ color }}>{trades}</div>
+          <div className="text-3xl font-bold" style={{ color: D_COLOR }}>{trades}</div>
           <div className="text-xs mt-1" style={{ color: '#8B949E' }}>Trades (24h)</div>
         </div>
         <div>
@@ -76,11 +65,8 @@ function ChartTooltip({ active, payload, label }) {
       </div>
       {payload.map((p) => (
         <div key={p.dataKey} className="flex items-center gap-2 mb-1">
-          <span
-            className="w-2 h-2 rounded-full inline-block"
-            style={{ background: p.color }}
-          />
-          <span style={{ color: p.color }}>Engine {p.dataKey}:</span>
+          <span className="w-2 h-2 rounded-full inline-block" style={{ background: p.color }} />
+          <span style={{ color: p.color }}>Engine D:</span>
           <span style={{ color: '#C9D1D9' }}>{parseFloat(p.value).toFixed(4)}%</span>
         </div>
       ))}
@@ -91,24 +77,19 @@ function ChartTooltip({ active, payload, label }) {
 // ── Trade Row ─────────────────────────────────────────────────────────────────
 
 function TradeRow({ trade }) {
-  const engine  = trade.engine_id;
-  const color   = ENGINE_COLORS[engine] || '#C9D1D9';
-  const netPnl  = parseFloat(trade.net_pnl ?? 0);
-  const roe     = parseFloat(trade.trade_roe_pct ?? 0);
-  const signal  = parseFloat(trade.entry_signal_value ?? 0);
-  const size    = parseFloat(trade.trade_size_usdt_idr ?? 0);
+  const netPnl = parseFloat(trade.net_pnl ?? 0);
+  const roe    = parseFloat(trade.trade_roe_pct ?? 0);
+  const signal = parseFloat(trade.entry_signal_value ?? 0);
+  const size   = parseFloat(trade.trade_size_idr ?? 0);
 
   return (
-    <tr
-      className="border-b"
-      style={{ background: ENGINE_BG[engine] || 'transparent', borderColor: '#30363D' }}
-    >
+    <tr className="border-b" style={{ background: D_BG, borderColor: '#30363D' }}>
       <td className="px-4 py-2">
         <span
           className="text-xs font-bold px-2 py-0.5 rounded"
-          style={{ background: `${color}22`, color }}
+          style={{ background: `${D_COLOR}22`, color: D_COLOR }}
         >
-          {engine}
+          D
         </span>
       </td>
       <td className="px-4 py-2 text-xs" style={{ color: '#C9D1D9' }}>
@@ -142,11 +123,11 @@ function TradeRow({ trade }) {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [kpis,      setKpis]      = useState({ A: null, B: null, C: null });
-  const [trades,    setTrades]    = useState([]);
-  const [chartData, setChartData] = useState([]);
+  const [kpis,       setKpis]       = useState({ D: null });
+  const [trades,     setTrades]     = useState([]);
+  const [chartData,  setChartData]  = useState([]);
   const [lastUpdate, setLastUpdate] = useState(null);
-  const [error,     setError]     = useState(null);
+  const [error,      setError]      = useState(null);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -190,12 +171,12 @@ export default function App() {
         <div>
           <h1
             className="text-2xl font-bold tracking-widest uppercase"
-            style={{ color: '#58A6FF' }}
+            style={{ color: D_COLOR }}
           >
             Project Mammon
           </h1>
           <p className="text-xs mt-1" style={{ color: '#8B949E' }}>
-            Algorithmic Arbitrage Telemetry &mdash; Simulation Mode
+            Engine D &mdash; Avellaneda-Stoikov HFT Market Maker
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -226,11 +207,9 @@ export default function App() {
         </div>
       </div>
 
-      {/* ── KPI Row ── */}
+      {/* ── KPI Card ── */}
       <div className="flex flex-wrap gap-4 mb-8">
-        {['A', 'B', 'C'].map((engine) => (
-          <KpiCard key={engine} engine={engine} data={kpis[engine]} />
-        ))}
+        <KpiCard data={kpis.D} />
       </div>
 
       {/* ── ROE Chart ── */}
@@ -242,7 +221,7 @@ export default function App() {
           className="text-xs font-semibold uppercase tracking-widest mb-4"
           style={{ color: '#8B949E' }}
         >
-          Cumulative ROE % &mdash; All Engines (24h)
+          Cumulative ROE % &mdash; Engine D (24h)
         </h2>
         {chartData.length === 0 ? (
           <div
@@ -271,25 +250,15 @@ export default function App() {
                 tickLine={false}
               />
               <Tooltip content={<ChartTooltip />} />
-              <Legend
-                formatter={(value) => (
-                  <span style={{ color: ENGINE_COLORS[value], fontSize: 11 }}>
-                    Engine {value} &mdash; {ENGINE_LABELS[value]}
-                  </span>
-                )}
-              />
               <ReferenceLine y={0} stroke="#30363D" strokeDasharray="4 4" />
-              {['A', 'B', 'C'].map((eng) => (
-                <Line
-                  key={eng}
-                  type="monotone"
-                  dataKey={eng}
-                  stroke={ENGINE_COLORS[eng]}
-                  strokeWidth={2}
-                  dot={false}
-                  activeDot={{ r: 4, fill: ENGINE_COLORS[eng] }}
-                />
-              ))}
+              <Line
+                type="monotone"
+                dataKey="D"
+                stroke={D_COLOR}
+                strokeWidth={2}
+                dot={false}
+                activeDot={{ r: 4, fill: D_COLOR }}
+              />
             </LineChart>
           </ResponsiveContainer>
         )}
@@ -331,7 +300,7 @@ export default function App() {
                     className="px-4 py-10 text-center text-sm"
                     style={{ color: '#8B949E' }}
                   >
-                    No trades logged yet. Engines are warming up&hellip;
+                    No trades logged yet. Engine D is warming up&hellip;
                   </td>
                 </tr>
               ) : (
@@ -346,7 +315,7 @@ export default function App() {
 
       {/* ── Footer ── */}
       <div className="mt-8 text-center text-xs" style={{ color: '#30363D' }}>
-        Project Mammon &mdash; Simulation Mode &mdash; No real funds at risk
+        Project Mammon &mdash; Engine D HFT &mdash; Agent Q v3 Hybrid Optimizer
       </div>
     </div>
   );

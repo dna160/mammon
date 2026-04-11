@@ -27,9 +27,11 @@ use futures_util::StreamExt;
 use redis::AsyncCommands;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_postgres::NoTls;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
@@ -182,11 +184,37 @@ fn moved_enough(new_price: f64, old_price: f64, tick_size: f64) -> bool {
 
 // ── Order manager task ────────────────────────────────────────────────────────
 
+/// Spawn a non-blocking PostgreSQL INSERT for a confirmed Engine D trade fill.
+/// Called from the order_manager after each fill; never blocks the hot path.
+fn spawn_telemetry_insert(
+    db:        Arc<tokio_postgres::Client>,
+    symbol:    String,
+    notional:  f64,
+    is_buyer:  bool,
+    fee:       f64,
+) {
+    tokio::spawn(async move {
+        let gross_pnl = if is_buyer { -notional } else { notional };
+        let net_pnl   = if is_buyer { -(notional + fee) } else { notional - fee };
+        let roe_pct   = (net_pnl / 28.0) * 100.0;
+        if let Err(e) = db.execute(
+            "INSERT INTO trade_telemetry \
+             (timestamp, engine_id, asset_pair, trade_size_idr, entry_signal_value, \
+              gross_pnl, fees_paid, net_pnl, trade_roe_pct) \
+             VALUES (NOW(), 'D', $1, $2, $3, $4, $5, $6, $7)",
+            &[&symbol, &notional, &0.0_f64, &gross_pnl, &fee, &net_pnl, &roe_pct],
+        ).await {
+            warn!("[{}] Telemetry INSERT failed: {}", symbol, e);
+        }
+    });
+}
+
 async fn order_manager(
     client:    std::sync::Arc<BinanceClient>,
     mut rx:    mpsc::Receiver<OrderCmd>,
     mut redis_con: redis::aio::MultiplexedConnection,
     fill_tx:   mpsc::Sender<FillNotif>,
+    db:        Arc<tokio_postgres::Client>,
 ) {
     // Per-coin state
     let mut states: HashMap<String, CoinState> = COIN_CONFIGS.iter()
@@ -326,6 +354,7 @@ async fn order_manager(
                             );
                             let key = format!("engine_d:{}:last_fill", symbol);
                             let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
+                            spawn_telemetry_insert(Arc::clone(&db), symbol.clone(), notional, fill.is_buyer, fill.trading_fee_usd);
                             let _ = lot_step; // suppress unused warning
                         }
                     }
@@ -470,6 +499,7 @@ async fn order_manager(
                                 );
                                 let key = format!("engine_d:{}:last_fill", symbol);
                                 let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
+                                spawn_telemetry_insert(Arc::clone(&db), symbol.clone(), notional, fill.is_buyer, fill.trading_fee_usd);
                             }
                             states.get_mut(&symbol).unwrap().last_fill_poll = Instant::now();
                         }
@@ -948,6 +978,8 @@ async fn main() -> Result<()> {
     let binance_secret = std::env::var("BINANCE_API_SECRET").unwrap_or_default();
     let redis_url      = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let db_dsn         = std::env::var("DB_DSN")
+        .unwrap_or_else(|_| "postgresql://mammon:mammon@localhost:5432/mammon".to_string());
 
     fn redact(s: &str) -> String {
         let n = s.len();
@@ -963,6 +995,17 @@ async fn main() -> Result<()> {
 
     let wss_url = build_wss_url();
     info!("WSS URL: {}", wss_url);
+
+    info!("Connecting to PostgreSQL…");
+    let (db_client, db_conn) = tokio_postgres::connect(&db_dsn, NoTls).await
+        .map_err(|e| anyhow::anyhow!("PostgreSQL connect failed: {}", e))?;
+    tokio::spawn(async move {
+        if let Err(e) = db_conn.await {
+            error!("PostgreSQL connection driver error: {}", e);
+        }
+    });
+    let db_client = Arc::new(db_client);
+    info!("PostgreSQL connected — telemetry writes enabled.");
 
     info!("Connecting to Redis…");
     let redis_client = redis::Client::open(redis_url)?;
@@ -985,8 +1028,9 @@ async fn main() -> Result<()> {
     {
         let client_arc = std::sync::Arc::clone(&binance_client);
         let om_con     = con.clone();
+        let om_db      = Arc::clone(&db_client);
         tokio::spawn(async move {
-            order_manager(client_arc, order_rx, om_con, fill_tx).await;
+            order_manager(client_arc, order_rx, om_con, fill_tx, om_db).await;
         });
         info!("Order manager task spawned — managing {} coins.", COIN_CONFIGS.len());
     }
