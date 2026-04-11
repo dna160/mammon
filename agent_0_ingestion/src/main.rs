@@ -198,7 +198,7 @@ fn spawn_telemetry_insert(
              (timestamp, engine_id, asset_pair, trade_size_idr, entry_signal_value, \
               gross_pnl, fees_paid, net_pnl, trade_roe_pct) \
              VALUES (NOW(), 'D', $1, $2, $3, $4, $5, $6, $7)",
-            &[&symbol, &notional, &0.0_f64, &gross_pnl, &fee, &net_pnl, &roe_pct],
+            &[&symbol, &notional, &fee, &gross_pnl, &fee, &net_pnl, &roe_pct],
         ).await {
             warn!("[{}] Telemetry INSERT failed: {}", symbol, e);
         }
@@ -296,6 +296,16 @@ async fn order_manager(
                     s.real_total_trades += 1;
                     if report.trade_id > 0 {
                         s.last_trade_id = report.trade_id as u64;
+                    }
+
+                    // Fix 1: Clear tracked order IDs on FILLED to prevent phantom cancel
+                    // API calls on already-filled orders (burns API weight, risks IP ban).
+                    if report.order_status == "FILLED" {
+                        if is_buyer {
+                            if s.bid_id == Some(report.order_id as u64) { s.bid_id = None; }
+                        } else {
+                            if s.ask_id == Some(report.order_id as u64) { s.ask_id = None; }
+                        }
                     }
 
                     // Alert main loop to update engine math
@@ -660,6 +670,8 @@ async fn stream_loop(
     // Per-coin tick counters.
     let mut tick_book:     HashMap<String, u64> = COIN_CONFIGS.iter().map(|c| (c.symbol.to_string(), 0u64)).collect();
     let mut tick_aggtrade: HashMap<String, u64> = COIN_CONFIGS.iter().map(|c| (c.symbol.to_string(), 0u64)).collect();
+    // Last computed TFI per symbol — updated every bookTicker tick, read by 1s telemetry snapshot.
+    let mut last_tfi: HashMap<String, f64> = COIN_CONFIGS.iter().map(|c| (c.symbol.to_string(), 0.0f64)).collect();
 
     let mut last_telemetry = Instant::now();
 
@@ -807,6 +819,8 @@ async fn stream_loop(
                 let tick_start = Instant::now();
                 let out        = engine.tick(bid, bid_vol, ask, ask_vol, now_ms);
                 let tick_us    = tick_start.elapsed().as_micros();
+                // Store latest TFI for the 1s Redis telemetry heartbeat (Python reads this).
+                *last_tfi.get_mut(&symbol).unwrap() = out.tfi;
                 *tick_book.get_mut(&symbol).unwrap() += 1;
                 let tb = tick_book[&symbol];
 
@@ -920,11 +934,13 @@ async fn stream_loop(
                     let pnl    = eng.pnl_usd;
                     let trades = eng.total_trades;
                     let var    = eng.variance;
+                    let tfi    = last_tfi.get(sym).copied().unwrap_or(0.0);
                     let tb_v   = tick_book.get(sym).copied().unwrap_or(0);
                     let ta_v   = tick_aggtrade.get(sym).copied().unwrap_or(0);
+                    // Include tfi so Python Agent Q can read live order-flow without needing trades.
                     let payload = format!(
-                        r#"{{"ts":{},"symbol":"{}","inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"variance":{:.10},"ticks_book":{},"ticks_agg":{}}}"#,
-                        ts, sym, inv, pnl, trades, var, tb_v, ta_v
+                        r#"{{"ts":{},"symbol":"{}","inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"variance":{:.10},"tfi":{:.4},"ticks_book":{},"ticks_agg":{}}}"#,
+                        ts, sym, inv, pnl, trades, var, tfi, tb_v, ta_v
                     );
                     let key = format!("telemetry:engine_d:{}", sym);
                     let mut c2 = tel_con.clone();
@@ -1093,12 +1109,14 @@ async fn main() -> Result<()> {
                                                     let _ = writer.send(Message::Pong(d)).await;
                                                 }
                                                 Some(Ok(Message::Close(_))) | None => {
-                                                    warn!("[UDS] stream closed — reconnecting…");
-                                                    break 'stream;
+                                                    // Fix 2: UDS Silent Death — stream dropped.
+                                                    // Exit so Docker auto-restarts and fetches a fresh listenKey.
+                                                    tracing::error!("CRITICAL: User Data Stream disconnected! Forcing process exit for Docker restart.");
+                                                    std::process::exit(1);
                                                 }
                                                 Some(Err(e)) => {
-                                                    warn!("[UDS] stream error: {} — reconnecting…", e);
-                                                    break 'stream;
+                                                    tracing::error!("CRITICAL: UDS stream error: {} — forcing process exit for Docker restart.", e);
+                                                    std::process::exit(1);
                                                 }
                                                 _ => {}
                                             }
@@ -1201,12 +1219,12 @@ async fn main() -> Result<()> {
                                                 }
                                                 Some(Ok(Message::Ping(d))) => { let _ = writer.send(Message::Pong(d)).await; }
                                                 Some(Ok(Message::Close(_))) | None => {
-                                                    warn!("[UDS] WS-API stream closed — reconnecting…");
-                                                    break 'wsapi;
+                                                    tracing::error!("CRITICAL: User Data Stream (WS-API) disconnected! Forcing process exit for Docker restart.");
+                                                    std::process::exit(1);
                                                 }
                                                 Some(Err(e)) => {
-                                                    warn!("[UDS] WS-API error: {} — reconnecting…", e);
-                                                    break 'wsapi;
+                                                    tracing::error!("CRITICAL: UDS WS-API error: {} — forcing process exit for Docker restart.", e);
+                                                    std::process::exit(1);
                                                 }
                                                 _ => {}
                                             }

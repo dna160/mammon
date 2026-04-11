@@ -44,7 +44,7 @@ def tune_parameters_for_symbol(symbol: str) -> None:
     log.info("[%s] Agent-1 raw (%.120s…)", symbol, raw_alpha)
     alpha_dict = extract_json(raw_alpha)
     log.info(
-        "[%s] Agent-1: regime=%s conf=%.2f γ=%.2f spread=%.1f tfi=%.2f",
+        "[%s] Agent-1: regime=%s conf=%.2f γ=%.2f spread=%.1f tfi=$%.0f",
         symbol,
         alpha_dict.get("regime"),
         float(alpha_dict.get("regime_confidence", 0)),
@@ -71,7 +71,7 @@ def tune_parameters_for_symbol(symbol: str) -> None:
         return
 
     log.info(
-        "[%s] Agent-2: γ=%.2f spread=%.1f tfi=%.2f override=%s",
+        "[%s] Agent-2: γ=%.2f spread=%.1f tfi=$%.0f override=%s",
         symbol,
         float(cro_dict.get("final_gamma", 0)),
         float(cro_dict.get("final_min_spread_ticks", 0)),
