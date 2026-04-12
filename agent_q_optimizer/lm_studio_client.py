@@ -92,13 +92,15 @@ def call_agent_1_alpha(
     Alpha Quant (Stage 1): propose parameters tailored for current_regime.
     Injects T-1 RL reward memory so the LLM can self-correct on low-volume cycles.
     Runs on MODEL_1 — returns raw LLM text with proposed_gamma / spread / tfi.
+    System prompt is static (no last_cycle_memory injection) to avoid context overflow.
+    T-1 memory is passed in the user message only.
     """
-    system = _load_prompt("agent_1_alpha.txt", last_cycle_memory=last_cycle_memory)
+    system = _load_prompt("agent_1_alpha.txt")   # static — no fmt injection needed
     user   = (
         f"CURRENT_REGIME: {current_regime}\n"
         f"T-1 MEMORY: {last_cycle_memory}\n"
-        f"MARKET_TELEMETRY_15MIN: {stats_str}\n\n"
-        "Propose optimal parameters for this regime. Respond with JSON only."
+        f"{stats_str}\n\n"
+        "Respond with JSON only."
     )
     log.debug("[Alpha] Calling %s …", MODEL_1)
     return _chat(_get_client1(), MODEL_1, system, user)

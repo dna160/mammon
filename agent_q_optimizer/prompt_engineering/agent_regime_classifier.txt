@@ -6,19 +6,21 @@ REGIME DEFINITIONS:
 - INSTITUTIONAL_ABSORPTION_DOWN — High/Extreme Vol, Toxic Dumping <-2σ, Strong Downtrend
 - MEAN_REVERTING                — Normal Vol, CLEAN flow, CHOP/RANGE, Low Adverse Selection
 - TOXIC_LIQUIDATION_CASCADE     — Extreme Vol, Toxicity >|3σ|, Adverse Selection >70%
-- DEAD_ZONE                     — Near-zero Volatility (<0.5 bps), No Drift
+- DEAD_ZONE                     — Extremely low vol (<0.15 bps/sec) AND LOB Spread >3 ticks (book is frozen)
 
-CLASSIFICATION RULES:
-- Adverse Selection >70% + Extreme Vol → always TOXIC_LIQUIDATION_CASCADE
-- Toxicity >+2σ + Uptrend → RETAIL_FRENZY_UP even if trades=0
-- Toxicity <-2σ + Downtrend → INSTITUTIONAL_ABSORPTION_DOWN
-- DEAD_ZONE requires BOTH near-zero vol AND near-zero drift — not just zero trades
-- Default to MEAN_REVERTING when signals are mixed or moderate
+CLASSIFICATION RULES (apply in strict priority order):
+1. Adverse Selection >70% + Extreme Vol → TOXIC_LIQUIDATION_CASCADE (always)
+2. Toxicity >+2σ + Uptrend            → RETAIL_FRENZY_UP
+3. Toxicity <-2σ + Downtrend          → INSTITUTIONAL_ABSORPTION_DOWN
+4. Vol <0.15 bps/sec AND LOB Spread >3 ticks → DEAD_ZONE (BOTH conditions required)
+5. Everything else → MEAN_REVERTING (this is the default — do NOT use DEAD_ZONE for normal-volatility markets)
+
+CRITICAL: If the volatility label is "NORMAL" (even if the bps value looks low), classify as MEAN_REVERTING unless rule 4 applies exactly. Low adverse selection and CHOP/RANGE drift are NOT DEAD_ZONE signals — they describe a healthy, quiet mean-reverting market. LOB Spread of 1–3 ticks = active book = MEAN_REVERTING.
 
 Output strict JSON only — no extra text:
 {"regime": "REGIME_NAME", "confidence": 0.95, "reasoning": "one sentence"}
 
-EXAMPLE 1 — Toxic dump:
+EXAMPLE 1 — Institutional dump:
 INPUT: [ORACLE 5M STATE VECTOR - DOGEFDUSD]
 1. Micro-Volatility: 14.20 bps/sec (HIGH)
 2. Order Flow Toxicity: -2.85σ (TOXIC DUMPING)
@@ -27,20 +29,29 @@ INPUT: [ORACLE 5M STATE VECTOR - DOGEFDUSD]
 5. Adverse Selection: 71.0% (DANGER (Run Over))
 OUTPUT: {"regime":"INSTITUTIONAL_ABSORPTION_DOWN","confidence":0.97,"reasoning":"High vol with toxic sell flow and strong downtrend confirms institutional distribution."}
 
-EXAMPLE 2 — Dead zone:
-INPUT: [ORACLE 5M STATE VECTOR - ADAFDUSD]
-1. Micro-Volatility: 0.18 bps/sec (NORMAL)
-2. Order Flow Toxicity: +0.12σ (CLEAN)
-3. Market Drift: +0.40 bps/5m (CHOP/RANGE)
-4. Native LOB Spread: 5.0 ticks
+EXAMPLE 2 — Quiet but active mean-reverting market (low vol ≠ dead zone):
+INPUT: [ORACLE 5M STATE VECTOR - XRPFDUSD]
+1. Micro-Volatility: 0.35 bps/sec (NORMAL)
+2. Order Flow Toxicity: +0.08σ (CLEAN)
+3. Market Drift: -4.20 bps/5m (CHOP/RANGE)
+4. Native LOB Spread: 1.1 ticks
 5. Adverse Selection: 0.0% (SAFE (Capturing Spread))
-OUTPUT: {"regime":"DEAD_ZONE","confidence":0.94,"reasoning":"Near-zero volatility and no directional drift confirms genuinely stale book."}
+OUTPUT: {"regime":"MEAN_REVERTING","confidence":0.91,"reasoning":"Normal-label volatility with tight 1-tick spread and clean flow — quiet but active book, ideal for mean-reversion scalping."}
 
 EXAMPLE 3 — Mean reverting with activity:
-INPUT: [ORACLE 5M STATE VECTOR - XRPFDUSD]
+INPUT: [ORACLE 5M STATE VECTOR - SOLFDUSD]
 1. Micro-Volatility: 6.50 bps/sec (NORMAL)
 2. Order Flow Toxicity: +0.45σ (CLEAN)
 3. Market Drift: +8.20 bps/5m (CHOP/RANGE)
-4. Native LOB Spread: 3.2 ticks
+4. Native LOB Spread: 1.2 ticks
 5. Adverse Selection: 22.0% (SAFE (Capturing Spread))
 OUTPUT: {"regime":"MEAN_REVERTING","confidence":0.88,"reasoning":"Normal volatility with clean balanced flow and low adverse selection — ideal 2-sided quoting conditions."}
+
+EXAMPLE 4 — True dead zone (frozen book, near-zero vol):
+INPUT: [ORACLE 5M STATE VECTOR - ADAFDUSD]
+1. Micro-Volatility: 0.05 bps/sec (NORMAL)
+2. Order Flow Toxicity: +0.01σ (CLEAN)
+3. Market Drift: +0.10 bps/5m (CHOP/RANGE)
+4. Native LOB Spread: 7.5 ticks
+5. Adverse Selection: 0.0% (SAFE (Capturing Spread))
+OUTPUT: {"regime":"DEAD_ZONE","confidence":0.95,"reasoning":"Extremely low vol (<0.15 bps) combined with frozen 7.5-tick LOB spread confirms a genuinely stale, illiquid book."}
