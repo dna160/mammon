@@ -44,13 +44,12 @@ def tune_parameters_for_symbol(symbol: str) -> None:
     log.info("[%s] Agent-1 raw (%.120s…)", symbol, raw_alpha)
     alpha_dict = extract_json(raw_alpha)
     log.info(
-        "[%s] Agent-1: regime=%s conf=%.2f γ=%.2f spread=%.1f tfi=$%.0f",
+        "[%s] Agent-1: γ=%.2f spread=%.1f tfi=$%.0f | %s",
         symbol,
-        alpha_dict.get("regime"),
-        float(alpha_dict.get("regime_confidence", 0)),
-        float(alpha_dict.get("proposed_gamma", 0)),
-        float(alpha_dict.get("proposed_min_spread_ticks", 0)),
-        float(alpha_dict.get("proposed_tfi_threshold", 0)),
+        float(alpha_dict.get("gamma", 0)),
+        float(alpha_dict.get("min_spread_ticks", 0)),
+        float(alpha_dict.get("tfi_threshold", 0)),
+        alpha_dict.get("reasoning", ""),
     )
 
     # Step 3: CRO — Dynamic Bounding Matrix for current_regime

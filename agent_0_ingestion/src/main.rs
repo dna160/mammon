@@ -897,9 +897,10 @@ async fn stream_loop(
                 }
 
                 let pp = format!(
-                    r#"{{"ts":{},"symbol":"{}","tick":{},"tick_us":{},"warm_ticks":{},"micro_price":{:.8},"obi":{:.6},"tfi":{:.6},"variance":{:.10},"reservation":{:.8},"optimal_bid":{:.8},"optimal_ask":{:.8},"spread":{:.8},"open_bid":{},"open_ask":{},"inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"decision":"{}"}}"#,
+                    r#"{{"ts":{},"symbol":"{}","tick":{},"tick_us":{},"warm_ticks":{},"micro_price":{:.8},"lob_bid":{:.8},"lob_ask":{:.8},"obi":{:.6},"tfi":{:.6},"variance":{:.10},"reservation":{:.8},"optimal_bid":{:.8},"optimal_ask":{:.8},"spread":{:.8},"open_bid":{},"open_ask":{},"inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"decision":"{}"}}"#,
                     now_ms, symbol, tb, tick_us, out.warm_ticks,
-                    out.micro_price, out.obi, out.tfi, out.variance,
+                    out.micro_price, bid, ask,
+                    out.obi, out.tfi, out.variance,
                     out.reservation_price,
                     out.optimal_bid, out.optimal_ask, spread,
                     out.open_bid.map(|v| format!("{:.8}", v)).unwrap_or_else(|| "null".into()),
