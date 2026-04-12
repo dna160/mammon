@@ -403,19 +403,23 @@ function AgentQPanel({ agentQ, rewardHistory }) {
 
 function HoldingsPanel({ holdings }) {
   const rows = Object.entries(COIN_META).map(([sym, meta]) => {
-    const h = holdings?.[sym];
-    const inv   = h?.inventory_coin ?? 0;
-    const price = h?.micro_price    ?? 0;
+    const h        = holdings?.[sym];
+    // Use real_inventory (exchange-reconciled) when available, fall back to shadow ledger
+    const realInv  = h?.real_inventory;
+    const shadowInv = h?.inventory_coin ?? 0;
+    const inv      = realInv !== null && realInv !== undefined ? realInv : shadowInv;
+    const isReal   = realInv !== null && realInv !== undefined;
+    const price    = h?.micro_price ?? 0;
     const notional = inv * price;
-    return { sym, meta, h, inv, price, notional };
+    return { sym, meta, h, inv, shadowInv, isReal, price, notional };
   });
 
-  const totalNotional = rows.reduce((s, r) => s + r.notional, 0);
+  const totalNotional = rows.reduce((s, r) => s + Math.abs(r.notional), 0);
 
   return (
     <Panel title="Holdings — Live Inventory">
-      <div className="overflow-y-auto" style={{ maxHeight: 280 }}>
-        {rows.map(({ sym, meta, h, inv, price, notional }) => (
+      <div className="overflow-y-auto" style={{ maxHeight: 300 }}>
+        {rows.map(({ sym, meta, h, inv, shadowInv, isReal, price, notional }) => (
           <div
             key={sym}
             className="flex items-center gap-3 px-4 py-3 border-b"
@@ -428,34 +432,69 @@ function HoldingsPanel({ holdings }) {
               {meta.coin[0]}
             </div>
             <div className="flex-1">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold" style={{ color: C.text }}>{meta.coin}</span>
-                <span
-                  className="text-sm font-mono font-bold"
-                  style={{ color: Math.abs(inv) > 0 ? C.blue : C.muted }}
-                >
-                  {inv !== 0 ? pp(inv, 6) : '—'}
-                </span>
+              <div className="flex items-center justify-between mb-0.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-bold" style={{ color: C.text }}>{meta.coin}</span>
+                  {h?.decision && (
+                    <Badge
+                      label={h.decision}
+                      color={h.decision === 'SKEW-ASK' ? C.amber : h.decision === 'SKEW-BID' ? C.green : h.decision === 'REQUOTE' ? C.blue : C.muted}
+                      size="xs"
+                    />
+                  )}
+                </div>
+                <div className="text-right">
+                  <div
+                    className="text-sm font-mono font-bold"
+                    style={{ color: Math.abs(inv) > 0 ? C.blue : C.muted }}
+                  >
+                    {Math.abs(inv) > 0 ? pp(inv, 6) : '—'} {meta.coin}
+                  </div>
+                  {!isReal && Math.abs(shadowInv) > 0 && (
+                    <div className="text-[9px]" style={{ color: C.amber }}>shadow ledger</div>
+                  )}
+                  {isReal && (
+                    <div className="text-[9px]" style={{ color: C.green }}>exchange ✓</div>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center justify-between mt-0.5">
-                <span className="text-[10px] font-mono" style={{ color: C.muted }}>
-                  @${fmtPrice(price)}
-                </span>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono" style={{ color: C.muted }}>
+                    mid ${fmtPrice(price)}
+                  </span>
+                  {h?.obi != null && (
+                    <span className="text-[10px] font-mono" style={{ color: h.obi > 0 ? C.green : C.red }}>
+                      OBI {ppm(h.obi, 3)}
+                    </span>
+                  )}
+                </div>
                 <span
                   className="text-[11px] font-mono font-semibold"
-                  style={{ color: notional > 0 ? C.amber : C.muted }}
+                  style={{ color: Math.abs(notional) > 0 ? C.amber : C.muted }}
                 >
-                  {notional > 0 ? `$${notional.toFixed(2)}` : '—'}
+                  {Math.abs(notional) > 0 ? `$${Math.abs(notional).toFixed(3)}` : '—'}
                 </span>
               </div>
+              {/* Engine PnL row */}
+              {h && (
+                <div className="flex items-center justify-between mt-0.5">
+                  <span className="text-[10px]" style={{ color: C.muted }}>
+                    σ² {h.variance?.toExponential(2) ?? '—'}
+                  </span>
+                  <span className="text-[10px] font-mono" style={{ color: (h.real_pnl_usd ?? h.pnl_usd) >= 0 ? C.green : C.red }}>
+                    PnL {ppm(h.real_pnl_usd ?? h.pnl_usd, 4)} USD
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         ))}
-        {/* Total */}
+        {/* Totals row */}
         <div className="flex items-center justify-between px-4 py-3" style={{ background: C.surface2 }}>
           <span className="text-xs font-semibold" style={{ color: C.muted }}>TOTAL NOTIONAL</span>
           <span className="text-sm font-mono font-bold" style={{ color: C.amber }}>
-            ${totalNotional.toFixed(2)}
+            ${totalNotional.toFixed(3)}
           </span>
         </div>
       </div>
@@ -467,17 +506,23 @@ function HoldingsPanel({ holdings }) {
 
 function OrderQueuePanel({ orders, holdings }) {
   const rows = Object.entries(COIN_META).map(([sym, meta]) => {
-    const o = orders?.[sym];
+    // Orders are now derived from holdings pipeline data (open_bid/open_ask)
     const h = holdings?.[sym];
-    const hasBid = o?.bid_id != null;
-    const hasAsk = o?.ask_id != null;
-    return { sym, meta, o, h, hasBid, hasAsk };
+    const openBid = h?.open_bid   ?? null;
+    const openAsk = h?.open_ask   ?? null;
+    const optBid  = h?.optimal_bid ?? null;
+    const optAsk  = h?.optimal_ask ?? null;
+    const hasBid  = openBid !== null;
+    const hasAsk  = openAsk !== null;
+    const ppState = h?.ping_pong ?? null;
+    const decision = h?.decision ?? '—';
+    return { sym, meta, h, openBid, openAsk, optBid, optAsk, hasBid, hasAsk, ppState, decision };
   });
 
   return (
     <Panel title="Order Queue — Active Bids / Asks">
-      <div className="overflow-y-auto" style={{ maxHeight: 280 }}>
-        {rows.map(({ sym, meta, o, hasBid, hasAsk }) => (
+      <div className="overflow-y-auto" style={{ maxHeight: 300 }}>
+        {rows.map(({ sym, meta, h, openBid, openAsk, optBid, optAsk, hasBid, hasAsk, ppState, decision }) => (
           <div
             key={sym}
             className="px-4 py-3 border-b"
@@ -486,52 +531,57 @@ function OrderQueuePanel({ orders, holdings }) {
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
                 <span className="text-xs font-bold" style={{ color: meta.color }}>{meta.coin}</span>
-                <PingPongBadge
-                  state={o ? (hasBid && !hasAsk ? 0 : hasAsk && !hasBid ? 1 : null) : null}
-                />
+                <PingPongBadge state={ppState} />
               </div>
               <span className="text-[10px] font-mono" style={{ color: C.muted }}>
-                {o?.real_trades ? `${o.real_trades} fills` : '—'}
+                {h?.total_trades ? `${h.total_trades} fills` : '0 fills'}
               </span>
             </div>
 
-            <div className="flex gap-4">
-              {/* BID */}
-              <div className="flex-1">
-                <div className="text-[10px] mb-1 font-semibold" style={{ color: hasBid ? C.green : C.muted }}>
-                  {hasBid ? '● BID (OPEN)' : '○ BID (NONE)'}
+            <div className="grid grid-cols-2 gap-3">
+              {/* BID side */}
+              <div
+                className="rounded p-2"
+                style={{ background: hasBid ? `${C.green}11` : C.surface2, border: `1px solid ${hasBid ? C.green + '44' : C.border}` }}
+              >
+                <div className="text-[10px] font-semibold mb-1" style={{ color: hasBid ? C.green : C.muted }}>
+                  {hasBid ? '● BID (LIVE)' : '○ BID (NONE)'}
                 </div>
                 <div className="text-sm font-mono font-bold" style={{ color: hasBid ? C.green : C.muted }}>
-                  {hasBid ? `$${fmtPrice(o.bid_price)}` : '—'}
+                  {hasBid ? `$${fmtPrice(openBid)}` : '—'}
                 </div>
-                <div className="text-[10px]" style={{ color: C.muted }}>
-                  id:{hasBid ? o.bid_id : '—'}
-                </div>
+                {optBid && (
+                  <div className="text-[9px] font-mono mt-0.5" style={{ color: C.muted }}>
+                    AS model: ${fmtPrice(optBid)}
+                  </div>
+                )}
               </div>
 
-              {/* ASK */}
-              <div className="flex-1">
-                <div className="text-[10px] mb-1 font-semibold" style={{ color: hasAsk ? C.red : C.muted }}>
-                  {hasAsk ? '● ASK (OPEN)' : '○ ASK (NONE)'}
+              {/* ASK side */}
+              <div
+                className="rounded p-2"
+                style={{ background: hasAsk ? `${C.red}11` : C.surface2, border: `1px solid ${hasAsk ? C.red + '44' : C.border}` }}
+              >
+                <div className="text-[10px] font-semibold mb-1" style={{ color: hasAsk ? C.red : C.muted }}>
+                  {hasAsk ? '● ASK (LIVE)' : '○ ASK (NONE)'}
                 </div>
                 <div className="text-sm font-mono font-bold" style={{ color: hasAsk ? C.red : C.muted }}>
-                  {hasAsk ? `$${fmtPrice(o.ask_price)}` : '—'}
+                  {hasAsk ? `$${fmtPrice(openAsk)}` : '—'}
                 </div>
-                <div className="text-[10px]" style={{ color: C.muted }}>
-                  id:{hasAsk ? o.ask_id : '—'}
-                </div>
-              </div>
-
-              {/* Spread */}
-              {hasBid && hasAsk && (
-                <div className="flex-1">
-                  <div className="text-[10px] mb-1" style={{ color: C.muted }}>SPREAD</div>
-                  <div className="text-sm font-mono font-bold" style={{ color: C.purple }}>
-                    {fmtPrice(Math.abs(o.ask_price - o.bid_price))}
+                {optAsk && (
+                  <div className="text-[9px] font-mono mt-0.5" style={{ color: C.muted }}>
+                    AS model: ${fmtPrice(optAsk)}
                   </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
+
+            {/* Spread row */}
+            {hasBid && hasAsk && (
+              <div className="mt-2 text-[10px] font-mono" style={{ color: C.purple }}>
+                spread: {fmtPrice(Math.abs((openAsk ?? 0) - (openBid ?? 0)))}
+              </div>
+            )}
           </div>
         ))}
       </div>

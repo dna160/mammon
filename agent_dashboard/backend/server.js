@@ -71,28 +71,64 @@ async function getHoldings() {
   await Promise.all(
     SYMBOLS.map(async (sym) => {
       try {
-        const raw = await redis.get(`engine_d:${sym}:pipeline`);
-        if (raw) {
-          const d = JSON.parse(raw);
-          holdings[sym] = {
-            inventory_coin: parseFloat(d.inventory_coin ?? 0),
-            pnl_usd:        parseFloat(d.pnl_usd       ?? 0),
-            micro_price:    parseFloat(d.micro_price    ?? 0),
-            total_trades:   parseInt(d.total_trades     ?? 0, 10),
-            decision:       d.decision ?? 'WARMING',
-            obi:            parseFloat(d.obi            ?? 0),
-            tfi:            parseFloat(d.tfi            ?? 0),
-            variance:       parseFloat(d.variance       ?? 0),
-            optimal_bid:    parseFloat(d.optimal_bid    ?? 0),
-            optimal_ask:    parseFloat(d.optimal_ask    ?? 0),
-            reservation:    parseFloat(d.reservation    ?? 0),
-            warm_ticks:     parseInt(d.warm_ticks       ?? 0, 10),
-            ts:             d.ts ?? null,
-          };
-        } else {
-          holdings[sym] = null;
-        }
+        const [rawPipe, rawOrders, rawTelemetry] = await Promise.all([
+          redis.get(`engine_d:${sym}:pipeline`),
+          redis.get(`engine_d:${sym}:orders`),
+          redis.get(`telemetry:engine_d:${sym}`),
+        ]);
+
+        if (!rawPipe) { holdings[sym] = null; return; }
+
+        const p = JSON.parse(rawPipe);
+        const o = rawOrders  ? JSON.parse(rawOrders)    : null;
+        const t = rawTelemetry ? JSON.parse(rawTelemetry) : null;
+
+        // open_bid / open_ask from pipeline are the current quoted prices
+        // (null means that side is not being quoted right now)
+        const openBid = (p.open_bid != null && p.open_bid !== 'null') ? parseFloat(p.open_bid) : null;
+        const openAsk = (p.open_ask != null && p.open_ask !== 'null') ? parseFloat(p.open_ask) : null;
+
+        // ping-pong state derived from which side is open
+        // State 0 (Empty)  = bidding only, no ask
+        // State 1 (Loaded) = asking only, no bid
+        const pingPong = (openBid !== null && openAsk === null) ? 0
+                       : (openAsk !== null && openBid === null) ? 1
+                       : (openBid !== null && openAsk !== null) ? 2   // both sides = REQUOTE
+                       : null;
+
+        // Real inventory from orders key (exchange-reconciled); pipeline = shadow ledger
+        const realInventory = o ? parseFloat(o.real_inventory ?? 0) : null;
+
+        holdings[sym] = {
+          // Shadow ledger (HFT internal model — may lag exchange reconciliation)
+          inventory_coin:  parseFloat(p.inventory_coin ?? 0),
+          // Real exchange inventory (from periodic balance reconciliation, null if stale)
+          real_inventory:  realInventory,
+          pnl_usd:         parseFloat(p.pnl_usd      ?? 0),
+          real_pnl_usd:    o ? parseFloat(o.real_pnl_usd ?? 0) : null,
+          micro_price:     parseFloat(p.micro_price   ?? 0),
+          lob_bid:         parseFloat(p.lob_bid       ?? 0),
+          lob_ask:         parseFloat(p.lob_ask       ?? 0),
+          obi:             parseFloat(p.obi           ?? 0),
+          tfi:             parseFloat(p.tfi           ?? 0),
+          variance:        parseFloat(p.variance      ?? 0),
+          reservation:     parseFloat(p.reservation   ?? 0),
+          optimal_bid:     parseFloat(p.optimal_bid   ?? 0),
+          optimal_ask:     parseFloat(p.optimal_ask   ?? 0),
+          open_bid:        openBid,
+          open_ask:        openAsk,
+          spread:          parseFloat(p.spread        ?? 0),
+          decision:        p.decision ?? 'WARMING',
+          ping_pong:       pingPong,
+          total_trades:    parseInt(p.total_trades ?? 0, 10),
+          warm_ticks:      parseInt(p.warm_ticks   ?? 0, 10),
+          ts:              p.ts ?? null,
+          // Telemetry extra fields
+          ticks_book:      t ? (t.ticks_book ?? 0) : 0,
+          ticks_agg:       t ? (t.ticks_agg  ?? 0) : 0,
+        };
       } catch (e) {
+        console.error(`[Holdings:${sym}]`, e.message);
         holdings[sym] = null;
       }
     })
@@ -101,34 +137,30 @@ async function getHoldings() {
 }
 
 async function getOrders() {
+  // Orders are derived from the holdings pipeline data (open_bid/open_ask)
+  // because the engine_d:{sym}:orders key is only written on order-manager events.
+  // We call getHoldings() and reshape for the orders panel.
+  const h = await getHoldings();
   const orders = {};
-  await Promise.all(
-    SYMBOLS.map(async (sym) => {
-      try {
-        const raw = await redis.get(`engine_d:${sym}:orders`);
-        if (raw) {
-          const d = JSON.parse(raw);
-          orders[sym] = {
-            bid_id:        d.bid_id   ?? null,
-            ask_id:        d.ask_id   ?? null,
-            bid_price:     parseFloat(d.bid_price      ?? 0),
-            ask_price:     parseFloat(d.ask_price      ?? 0),
-            real_pnl_usd:  parseFloat(d.real_pnl_usd   ?? 0),
-            real_inventory: parseFloat(d.real_inventory ?? 0),
-            real_trades:   parseInt(d.real_trades      ?? 0, 10),
-            ts:            d.ts ?? null,
-            // ping-pong state: 0 = bidding (State 0/Empty), 1 = asking (State 1/Loaded)
-            ping_pong: d.bid_id && !d.ask_id ? 0 :
-                       d.ask_id && !d.bid_id ? 1 : null,
-          };
-        } else {
-          orders[sym] = null;
-        }
-      } catch (e) {
-        orders[sym] = null;
-      }
-    })
-  );
+  SYMBOLS.forEach((sym) => {
+    const d = h[sym];
+    if (!d) { orders[sym] = null; return; }
+
+    // Try the raw orders key for real order IDs
+    orders[sym] = {
+      bid_id:         null,   // order IDs not persistently available in this version
+      ask_id:         null,
+      bid_price:      d.open_bid,      // from pipeline — the actual quoted price
+      ask_price:      d.open_ask,
+      optimal_bid:    d.optimal_bid,   // from AS model — what it WANTS to quote
+      optimal_ask:    d.optimal_ask,
+      real_pnl_usd:   d.real_pnl_usd,
+      real_inventory: d.real_inventory,
+      decision:       d.decision,
+      ping_pong:      d.ping_pong,
+      ts:             d.ts,
+    };
+  });
   return orders;
 }
 
