@@ -280,15 +280,31 @@ async fn order_manager(
                     info!("[OrderMgr] Balance refresh — FDUSD={:.2}", fdusd);
                     // AMNESIA FIX: reconcile shadow ledger with free+locked ground truth.
                     // Protects against drift between UDS deltas and exchange reality.
+                    // CRITICAL: also propagate via fill_tx so eng.inventory_coin (tick loop)
+                    // stays in sync — without this, the ping-pong state machine never switches
+                    // from SKEW-BID to SKEW-ASK even when the exchange has real inventory.
                     for cfg in COIN_CONFIGS {
                         let total = b.get(cfg.coin_asset).copied().unwrap_or(0.0);
                         if let Some(s) = states.get_mut(cfg.symbol) {
-                            if (s.real_inventory - total).abs() > cfg.lot_step {
+                            let delta = total - s.real_inventory;
+                            if delta.abs() > cfg.lot_step {
                                 info!(
-                                    "[{}] Inventory reconciled: shadow={:.8} → exchange={:.8}",
-                                    cfg.symbol, s.real_inventory, total
+                                    "[{}] Inventory reconciled: shadow={:.8} → exchange={:.8} (Δ{:+.8})",
+                                    cfg.symbol, s.real_inventory, total, delta
                                 );
                                 s.real_inventory = total;
+                                // Propagate to HFT engine tick loop — same synthetic-fill
+                                // mechanism as startup seed. price=0.0 → no PnL impact.
+                                // is_buy=true if we gained coin (exchange > shadow),
+                                // is_buy=false if we lost coin (sold/dust removed).
+                                let is_buy = delta > 0.0;
+                                let _ = fill_tx.try_send((
+                                    cfg.symbol.to_string(),
+                                    is_buy,
+                                    0.0,          // price=0 → no PnL impact
+                                    delta.abs(),  // qty delta
+                                    0.0,          // fee=0 → no PnL impact
+                                ));
                             }
                         }
                     }
