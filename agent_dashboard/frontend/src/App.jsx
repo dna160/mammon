@@ -48,10 +48,11 @@ const REGIME_META = {
 };
 
 const COIN_META = {
-  ADAFDUSD:  { coin: 'ADA',  color: '#0033AD' },
-  DOTFDUSD:  { coin: 'DOT',  color: '#E6007A' },
-  DOGEFDUSD: { coin: 'DOGE', color: '#C3A634' },
+  SOLFDUSD:  { coin: 'SOL',  color: '#9945FF' },
   XRPFDUSD:  { coin: 'XRP',  color: '#00AAE4' },
+  DOGEFDUSD: { coin: 'DOGE', color: '#C3A634' },
+  ETHFDUSD:  { coin: 'ETH',  color: '#627EEA' },
+  BNBFDUSD:  { coin: 'BNB',  color: '#F3BA2F' },
 };
 
 const pp = (n, d = 4) => (isNaN(n) ? '—' : parseFloat(n).toFixed(d));
@@ -248,6 +249,12 @@ function AgentQPanel({ agentQ, rewardHistory }) {
     [rewardHistory, activeTab],
   );
 
+  // T-1 memory: most recent evaluated row (has reward_score set)
+  const lastEvaluated = useMemo(
+    () => symHistory.find((r) => r.evaluated_at != null && r.reward_score != null),
+    [symHistory],
+  );
+
   const bestAction  = symHistory.filter((r) => r.reward_score > 0).sort((a,b) => b.reward_score - a.reward_score)[0];
   const worstAction = symHistory.filter((r) => r.reward_score < 0).sort((a,b) => a.reward_score - b.reward_score)[0];
 
@@ -314,6 +321,58 @@ function AgentQPanel({ agentQ, rewardHistory }) {
         ) : (
           <div className="text-xs" style={{ color: C.muted }}>No params published yet.</div>
         )}
+
+        {/* T-1 RL Memory */}
+        <div
+          className="rounded p-3 border"
+          style={{ background: C.surface2, borderColor: C.border }}
+        >
+          <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: C.muted }}>
+            T-1 RL Memory — Cadence Feedback
+          </div>
+          {lastEvaluated ? (
+            <div className="flex flex-wrap gap-4">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[10px]" style={{ color: C.muted }}>REWARD</span>
+                <span className="text-sm font-mono font-bold"
+                  style={{ color: parseFloat(lastEvaluated.reward_score) >= 0 ? C.green : C.red }}>
+                  {ppm(lastEvaluated.reward_score, 2)}
+                </span>
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[10px]" style={{ color: C.muted }}>ROUND TRIPS</span>
+                <span className="text-sm font-mono font-bold"
+                  style={{ color: (lastEvaluated.total_round_trips ?? 0) >= 100 ? C.green : C.red }}>
+                  {lastEvaluated.total_round_trips ?? 0}
+                  <span className="text-[10px] font-normal" style={{ color: C.muted }}>/100</span>
+                </span>
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[10px]" style={{ color: C.muted }}>WIN RATE</span>
+                <span className="text-sm font-mono font-bold"
+                  style={{ color: (lastEvaluated.win_rate_pct ?? 0) >= 50 ? C.green : C.amber }}>
+                  {pp(lastEvaluated.win_rate_pct, 1)}%
+                </span>
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[10px]" style={{ color: C.muted }}>NET PnL</span>
+                <span className="text-sm font-mono font-bold"
+                  style={{ color: parseFloat(lastEvaluated.net_pnl ?? 0) >= 0 ? C.green : C.red }}>
+                  {ppm(lastEvaluated.net_pnl, 4)}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs" style={{ color: C.muted }}>
+              No evaluated cycles yet — first reward computed at T+15min.
+            </div>
+          )}
+          {params?.cro_reasoning && (
+            <div className="mt-2 text-[10px] italic border-t pt-2" style={{ color: C.muted, borderColor: C.border }}>
+              CRO: {params.cro_reasoning}
+            </div>
+          )}
+        </div>
 
         {/* State Vector */}
         {sv ? (
@@ -765,7 +824,7 @@ function TradeLog({ trades }) {
 // ── Reward History ────────────────────────────────────────────────────────────
 
 function RewardHistory({ data }) {
-  const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'TFI', 'Net PnL', 'AQ%', 'Score', 'Override'];
+  const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'TFI', 'Trips', 'Win%', 'Net PnL', 'AQ%', 'Score', 'Override'];
 
   return (
     <Panel title="Agent Q Memory — RAG Reward Scorecard">
@@ -814,6 +873,14 @@ function RewardHistory({ data }) {
                     </td>
                     <td className="px-3 py-2 text-xs font-mono" style={{ color: C.text }}>
                       {parseFloat(r.tfi_threshold ?? 0).toLocaleString()}
+                    </td>
+                    <td className="px-3 py-2 text-xs font-mono font-bold"
+                      style={{ color: pending ? C.muted : (r.total_round_trips ?? 0) >= 100 ? C.green : C.red }}>
+                      {pending ? '—' : (r.total_round_trips ?? 0)}
+                    </td>
+                    <td className="px-3 py-2 text-xs font-mono font-bold"
+                      style={{ color: pending ? C.muted : (r.win_rate_pct ?? 0) >= 50 ? C.green : C.amber }}>
+                      {pending ? '—' : `${pp(r.win_rate_pct, 1)}%`}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
                       style={{ color: pending ? C.muted : pnl >= 0 ? C.green : C.red }}>
@@ -883,8 +950,11 @@ export default function App() {
       ws.onopen    = () => { setWsStatus('live'); console.log('[WS] Connected.'); };
       ws.onmessage = (e) => {
         try {
-          setSnapshot(JSON.parse(e.data));
+          const parsed = JSON.parse(e.data);
+          setSnapshot(parsed);
           setLastUpdate(Date.now());
+          // Reward history is now included in the snapshot push — update inline
+          if (parsed.reward_history?.length) setRewardHist(parsed.reward_history);
         } catch (_) {}
       };
       ws.onerror = () => setWsStatus('error');

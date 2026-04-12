@@ -26,7 +26,7 @@ const PORT   = process.env.PORT    || 4000;
 const DB_DSN = process.env.DB_DSN  || 'postgresql://mammon:mammon@localhost:5432/mammon';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
-const SYMBOLS = ['ADAFDUSD', 'DOTFDUSD', 'DOGEFDUSD', 'XRPFDUSD'];
+const SYMBOLS = ['SOLFDUSD', 'XRPFDUSD', 'DOGEFDUSD', 'ETHFDUSD', 'BNBFDUSD'];
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
@@ -295,6 +295,7 @@ async function getRewardHistory(limit = 50) {
         proposed_gamma, proposed_min_spread, tfi_threshold,
         vol_bps, tfi_zscore, drift_bps, native_spread,
         net_pnl, adverse_selection, reward_score,
+        total_round_trips, win_rate_pct,
         alpha_reasoning, cro_reasoning, override_applied
       FROM agent_q_memory
       ORDER BY timestamp DESC
@@ -308,7 +309,7 @@ async function getRewardHistory(limit = 50) {
 }
 
 async function getFullSnapshot() {
-  const [holdings, orders, lastFills, agentQ, kpis, trades, chart] = await Promise.all([
+  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory] = await Promise.all([
     getHoldings(),
     getOrders(),
     getLastFills(),
@@ -316,6 +317,7 @@ async function getFullSnapshot() {
     getKpis(),
     getTrades(100),
     getChart(),
+    getRewardHistory(50),
   ]);
 
   // Compute per-symbol cumulative PnL from holdings (live engine data)
@@ -325,16 +327,17 @@ async function getFullSnapshot() {
   });
 
   return {
-    ts:        Date.now(),
+    ts:             Date.now(),
     kpis,
     trades,
     chart,
     holdings,
     orders,
-    last_fills: lastFills,
-    agent_q:   agentQ,
-    live_pnl:  livePnl,
-    symbols:   SYMBOLS,
+    last_fills:     lastFills,
+    agent_q:        agentQ,
+    live_pnl:       livePnl,
+    symbols:        SYMBOLS,
+    reward_history: rewardHistory,
   };
 }
 
