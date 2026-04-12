@@ -1,83 +1,332 @@
 """
 Parameter Tuner — Agent Q Tactical Loop (every 15 minutes).
 
-CRITICAL: Reads the currently active regime from Redis BEFORE running the
-adversarial pipeline. The CRO Agent enforces the Dynamic Bounding Matrix
-specific to that regime — not static global bounds.
+V2 additions per PRD §5 (RAG Memory):
+  - Writes each parameter decision to agent_q_memory table before publishing.
+  - Retrieves Top 2 / Bottom 2 historical actions for the active regime and
+    injects them into the Alpha prompt (Retrieval-Augmented Reflection).
+  - A background evaluator thread continuously back-fills net_pnl and
+    reward_score on entries older than 15 minutes (async, never blocks trading).
 
 Pipeline:
   1. Read current regime from Redis (set by Oracle every 5m)
   2. Query 15-minute telemetry from PostgreSQL
-  3. Agent 1 (Alpha Quant) — propose gamma/spread tailored to current regime
-  4. Agent 2 (CRO)         — enforce regime-specific Dynamic Bounding Matrix
-  5. Publish final params  → hft:live_params:{symbol}
+  3. [V2] Retrieve RAG memory for current regime (Top 2 best / Bottom 2 worst)
+  4. Agent 1 (Alpha Quant) — propose gamma/spread with historical context injected
+  5. Agent 2 (CRO)         — enforce Dynamic Bounding Matrix
+  6. [V2] Log decision to agent_q_memory (id returned for 15m reward back-fill)
+  7. Publish final params  → hft:live_params:{symbol}
 """
 import json
 import logging
+import os
+import threading
+import time
 
-from data_pipeline    import fetch_telemetry_window
+import psycopg2
+import psycopg2.extras
+
+from data_pipeline    import fetch_telemetry_window, get_state_vector_structured
 from lm_studio_client import call_agent_1_alpha, call_agent_2_risk
 from json_sanitizer   import extract_json
 from redis_bridge     import publish_params, publish_safe_mode, get_current_regime
 
 log = logging.getLogger(__name__)
 
+DB_DSN = os.getenv("DB_DSN", "postgresql://mammon:mammon@postgres:5432/mammon")
+
+# ── Pending reward queue: list of (memory_id, symbol, eval_after_ts) ─────────
+_reward_queue: list[tuple[int, str, float]] = []
+_reward_lock  = threading.Lock()
+
+
+# ── Database helpers ──────────────────────────────────────────────────────────
+
+def _get_db():
+    return psycopg2.connect(DB_DSN, connect_timeout=5)
+
+
+def _retrieve_rag_memory(symbol: str, regime: str) -> str:
+    """
+    Query agent_q_memory for Top 2 best and Bottom 2 worst decisions in this regime.
+    Returns an injected memory block string ready for the LLM prompt.
+    PRD §5C: Retrieval-Augmented Reflection.
+    """
+    try:
+        conn = _get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Top 2 rewarded in this regime
+            cur.execute("""
+                SELECT proposed_gamma, proposed_min_spread, net_pnl, adverse_selection,
+                       reward_score, alpha_reasoning
+                FROM   agent_q_memory
+                WHERE  symbol  = %s
+                  AND  regime  = %s
+                  AND  evaluated_at IS NOT NULL
+                ORDER  BY reward_score DESC
+                LIMIT  2
+            """, (symbol, regime))
+            best = cur.fetchall()
+
+            # Bottom 2 punished
+            cur.execute("""
+                SELECT proposed_gamma, proposed_min_spread, net_pnl, adverse_selection,
+                       reward_score, alpha_reasoning
+                FROM   agent_q_memory
+                WHERE  symbol  = %s
+                  AND  regime  = %s
+                  AND  evaluated_at IS NOT NULL
+                ORDER  BY reward_score ASC
+                LIMIT  2
+            """, (symbol, regime))
+            worst = cur.fetchall()
+        conn.close()
+
+        if not best and not worst:
+            return ""
+
+        lines = [f"\n**YOUR HISTORICAL MEMORY FOR {regime}:**"]
+        if best:
+            lines.append("SUCCESSFUL PAST ACTIONS (REWARDED):")
+            for r in best:
+                lines.append(
+                    f"- Spread: {r['proposed_min_spread']:.1f}, "
+                    f"Gamma: {r['proposed_gamma']:.2f} | "
+                    f"Outcome: {'+' if r['net_pnl'] >= 0 else ''}{r['net_pnl']:.2f} PnL "
+                    f"(AQ: {r['adverse_selection']:.0f}%)"
+                )
+        if worst:
+            lines.append("FAILED PAST ACTIONS (PUNISHED — DO NOT REPEAT):")
+            for r in worst:
+                lines.append(
+                    f"- Spread: {r['proposed_min_spread']:.1f}, "
+                    f"Gamma: {r['proposed_gamma']:.2f} | "
+                    f"Outcome: {'+' if r['net_pnl'] >= 0 else ''}{r['net_pnl']:.2f} PnL "
+                    f"(DANGER AQ: {r['adverse_selection']:.0f}% — DO NOT REPEAT)"
+                )
+        return "\n".join(lines)
+
+    except Exception as exc:
+        log.warning("[%s] RAG memory retrieval failed: %s", symbol, exc)
+        return ""
+
+
+def _log_decision(
+    symbol: str,
+    regime: str,
+    gamma: float,
+    min_spread: float,
+    tfi_threshold: float,
+    metrics: dict,
+    alpha_reasoning: str,
+    cro_reasoning: str,
+    override_applied: bool,
+) -> int | None:
+    """
+    Insert a new agent_q_memory row and return its id.
+    The reward back-filler will update net_pnl + reward_score 15 min later.
+    """
+    try:
+        conn = _get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO agent_q_memory
+                    (symbol, regime, proposed_gamma, proposed_min_spread, tfi_threshold,
+                     vol_bps, tfi_zscore, drift_bps, native_spread,
+                     alpha_reasoning, cro_reasoning, override_applied)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                symbol, regime, gamma, min_spread, tfi_threshold,
+                metrics.get("vol_bps", 0),
+                metrics.get("tfi_zscore", 0),
+                metrics.get("drift_bps", 0),
+                metrics.get("native_spread", 0),
+                alpha_reasoning[:500] if alpha_reasoning else None,
+                cro_reasoning[:500]   if cro_reasoning   else None,
+                override_applied,
+            ))
+            mem_id = cur.fetchone()[0]
+        conn.commit()
+        conn.close()
+        log.info("[%s] agent_q_memory id=%d logged.", symbol, mem_id)
+        return mem_id
+    except Exception as exc:
+        log.error("[%s] Failed to log agent_q_memory: %s", symbol, exc)
+        return None
+
+
+def _evaluate_reward(mem_id: int, symbol: str) -> None:
+    """
+    PRD §5B: Reward = Net PnL - Adverse Selection Penalty.
+    Queries the 15-minute PnL window that started when parameters were injected
+    and back-fills agent_q_memory with net_pnl, adverse_selection, reward_score.
+    """
+    try:
+        conn = _get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Get the timestamp of the decision
+            cur.execute("SELECT timestamp FROM agent_q_memory WHERE id = %s", (mem_id,))
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                return
+            decision_ts = row["timestamp"]
+
+            # Net PnL accumulated in the 15m window after the decision
+            cur.execute("""
+                SELECT COALESCE(SUM(net_pnl), 0) AS net_pnl,
+                       COALESCE(
+                           100.0 * SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END)
+                           / NULLIF(COUNT(*), 0),
+                           0
+                       ) AS adverse_pct
+                FROM  trade_telemetry
+                WHERE engine_id  = 'D'
+                  AND asset_pair = %s
+                  AND timestamp  BETWEEN %s AND %s + INTERVAL '15 minutes'
+            """, (symbol, decision_ts, decision_ts))
+            res = cur.fetchone()
+
+            net_pnl  = float(res["net_pnl"]      if res else 0)
+            adv_pct  = float(res["adverse_pct"]   if res else 0)
+
+            # PRD §5B: Reward = Net PnL - Adverse Selection Penalty
+            # AQ > 60% = heavily punished, AQ < 30% = rewarded
+            aq_penalty   = max(0.0, (adv_pct - 30.0) * 0.5)  # penalty ramps above 30%
+            reward_score = net_pnl - aq_penalty
+
+            cur.execute("""
+                UPDATE agent_q_memory
+                SET    net_pnl          = %s,
+                       adverse_selection = %s,
+                       reward_score     = %s,
+                       evaluated_at     = NOW()
+                WHERE  id = %s
+            """, (net_pnl, adv_pct, reward_score, mem_id))
+
+        conn.commit()
+        conn.close()
+        log.info(
+            "[%s] Reward evaluated for id=%d: PnL=%.4f AQ=%.1f%% score=%.4f",
+            symbol, mem_id, net_pnl, adv_pct, reward_score,
+        )
+    except Exception as exc:
+        log.error("[%s] Reward evaluation failed for id=%d: %s", symbol, mem_id, exc)
+
+
+# ── Background reward evaluator (runs every 60s) ─────────────────────────────
+
+def _reward_evaluator_loop() -> None:
+    """Daemon thread — continuously checks the pending queue for entries ready to score."""
+    log.info("Reward evaluator started.")
+    while True:
+        time.sleep(60)
+        now = time.monotonic()
+        with _reward_lock:
+            ready    = [(mid, sym) for (mid, sym, after) in _reward_queue if now >= after]
+            _reward_queue[:] = [(mid, sym, after) for (mid, sym, after) in _reward_queue if now < after]
+
+        for mem_id, symbol in ready:
+            try:
+                _evaluate_reward(mem_id, symbol)
+            except Exception as exc:
+                log.error("Reward eval error id=%d: %s", mem_id, exc)
+
+
+# Start the daemon reward thread on first import
+_reward_thread = threading.Thread(target=_reward_evaluator_loop, name="RewardEval", daemon=True)
+_reward_thread.start()
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def tune_parameters_for_symbol(symbol: str) -> None:
     """
     Run the adversarial parameter-tuning pipeline for one symbol.
+    V2: injects RAG memory into Alpha prompt + logs decision to agent_q_memory.
     Raises on any error — caller handles safe-mode fallback.
     """
-    log.info("[%s] ── Tactical cycle start ────────────────────────────────", symbol)
+    log.info("[%s] \u2500\u2500 Tactical cycle start \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", symbol)
 
     # Step 0: Read regime from Oracle (Redis)
     current_regime = get_current_regime(symbol)
     log.info("[%s] Active regime: %s", symbol, current_regime)
 
-    # Step 1: 15-minute telemetry
+    # Step 1: 15-minute telemetry + structured metrics
     stats_str = fetch_telemetry_window(symbol, window_minutes=15)
+    metrics   = get_state_vector_structured(symbol, window_minutes=15)
     log.info("[%s] Tactical telemetry: %s", symbol, stats_str)
 
-    # Step 2: Alpha Quant — regime-aware proposal
-    # Inject regime context into user message so Alpha proposes within bounds
-    raw_alpha  = call_agent_1_alpha(stats_str, current_regime=current_regime)
-    log.info("[%s] Agent-1 raw (%.120s…)", symbol, raw_alpha)
+    # Step 2: [V2] Retrieve RAG memory for this regime
+    rag_block = _retrieve_rag_memory(symbol, current_regime)
+    if rag_block:
+        log.info("[%s] RAG memory injected (%d chars).", symbol, len(rag_block))
+        stats_str_with_rag = stats_str + "\n" + rag_block
+    else:
+        stats_str_with_rag = stats_str
+
+    # Step 3: Alpha Quant — regime-aware proposal with RAG context
+    raw_alpha  = call_agent_1_alpha(stats_str_with_rag, current_regime=current_regime)
+    log.info("[%s] Agent-1 raw (%.120s\u2026)", symbol, raw_alpha)
     alpha_dict = extract_json(raw_alpha)
+    alpha_reasoning = alpha_dict.get("reasoning", "")
     log.info(
-        "[%s] Agent-1: γ=%.2f spread=%.1f tfi=$%.0f | %s",
+        "[%s] Agent-1: \u03b3=%.2f spread=%.1f tfi=$%.0f | %s",
         symbol,
         float(alpha_dict.get("gamma", 0)),
         float(alpha_dict.get("min_spread_ticks", 0)),
         float(alpha_dict.get("tfi_threshold", 0)),
-        alpha_dict.get("reasoning", ""),
+        alpha_reasoning,
     )
 
-    # Step 3: CRO — Dynamic Bounding Matrix for current_regime
+    # Step 4: CRO — Dynamic Bounding Matrix for current_regime
     raw_cro  = call_agent_2_risk(
         stats_str,
         json.dumps(alpha_dict, separators=(",", ":")),
         current_regime=current_regime,
     )
-    log.info("[%s] Agent-2 raw (%.120s…)", symbol, raw_cro)
+    log.info("[%s] Agent-2 raw (%.120s\u2026)", symbol, raw_cro)
     cro_dict = extract_json(raw_cro)
+    cro_reasoning    = cro_dict.get("cro_reasoning", "")
+    override_applied = bool(cro_dict.get("override_applied", False))
 
     # Handle TOXIC_LIQUIDATION_CASCADE veto
     if cro_dict.get("panic_sell_flag") is True:
         log.critical(
-            "[%s] CRO VETO — TOXIC_LIQUIDATION_CASCADE. gamma forced 1.0, safe mode.", symbol
+            "[%s] CRO VETO \u2014 TOXIC_LIQUIDATION_CASCADE. gamma forced 1.0, safe mode.", symbol
         )
         publish_safe_mode(symbol)
         return
 
+    final_gamma  = float(cro_dict.get("final_gamma",            0.8))
+    final_spread = float(cro_dict.get("final_min_spread_ticks", 10.0))
+    final_tfi    = float(cro_dict.get("final_tfi_threshold",    65_000.0))
+
     log.info(
-        "[%s] Agent-2: γ=%.2f spread=%.1f tfi=$%.0f override=%s",
-        symbol,
-        float(cro_dict.get("final_gamma", 0)),
-        float(cro_dict.get("final_min_spread_ticks", 0)),
-        float(cro_dict.get("final_tfi_threshold", 0)),
-        cro_dict.get("override_applied"),
+        "[%s] Agent-2: \u03b3=%.2f spread=%.1f tfi=$%.0f override=%s",
+        symbol, final_gamma, final_spread, final_tfi, override_applied,
     )
 
-    # Step 4: Publish tuned params to Rust
+    # Step 5: [V2] Log decision to agent_q_memory BEFORE publishing
+    mem_id = _log_decision(
+        symbol         = symbol,
+        regime         = current_regime,
+        gamma          = final_gamma,
+        min_spread     = final_spread,
+        tfi_threshold  = final_tfi,
+        metrics        = metrics,
+        alpha_reasoning = alpha_reasoning,
+        cro_reasoning   = cro_reasoning,
+        override_applied = override_applied,
+    )
+
+    # Schedule reward back-fill 15 min from now
+    if mem_id is not None:
+        eval_after = time.monotonic() + 15 * 60
+        with _reward_lock:
+            _reward_queue.append((mem_id, symbol, eval_after))
+
+    # Step 6: Publish tuned params to Rust engine
     publish_params(symbol, cro_dict)
-    log.info("[%s] ── Tactical params injected ──────────────────────────────", symbol)
+    log.info("[%s] \u2500\u2500 Tactical params injected \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", symbol)
