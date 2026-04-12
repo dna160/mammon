@@ -51,7 +51,7 @@ ACTIVE_SYMBOLS = [
     s.strip()
     for s in os.getenv(
         "ACTIVE_SYMBOLS",
-        "ADAFDUSD,DOTFDUSD,DOGEFDUSD,XRPFDUSD",
+        "SOLFDUSD,XRPFDUSD,DOGEFDUSD,ETHFDUSD,BNBFDUSD",
     ).split(",")
     if s.strip()
 ]

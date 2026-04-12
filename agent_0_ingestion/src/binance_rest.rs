@@ -500,7 +500,10 @@ pub fn qty_from_fixed_notional(price: f64, lot_step: f64) -> f64 {
 /// still above MIN_NOTIONAL — lets the bot trade with what it actually has.
 pub fn qty_from_notional(notional: f64, price: f64, lot_step: f64) -> f64 {
     if price <= 0.0 || notional <= 0.0 { return 0.0; }
-    let raw     = notional / price;
-    let stepped = (raw / lot_step).ceil() * lot_step;
+    let raw = notional / price;
+    // Prefer floor to avoid over-committing capital on high-price coins (BNB, ETH, SOL).
+    // If floor qty would fall below MIN_NOTIONAL, step up one lot.
+    let floored = (raw / lot_step).floor() * lot_step;
+    let stepped = if floored * price >= MIN_NOTIONAL { floored } else { floored + lot_step };
     if stepped * price < MIN_NOTIONAL { 0.0 } else { stepped }
 }

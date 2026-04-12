@@ -69,10 +69,12 @@ CREATE TABLE IF NOT EXISTS agent_q_memory (
     tfi_zscore         FLOAT   NOT NULL DEFAULT 0,     -- Order Flow Z-Score
     drift_bps          FLOAT   NOT NULL DEFAULT 0,     -- Market Drift
     native_spread      FLOAT   NOT NULL DEFAULT 0,     -- LOB Spread (ticks)
-    -- Outcomes (back-filled after 15 min)
+    -- Outcomes (back-filled after 15 min) — RL Hyper-Cadence metrics
+    total_round_trips  INT     NOT NULL DEFAULT 0,   -- filled round trips in the 15m window
+    win_rate_pct       FLOAT   NOT NULL DEFAULT 0.0, -- % of profitable round trips
     net_pnl            FLOAT   NOT NULL DEFAULT 0,
     adverse_selection  FLOAT   NOT NULL DEFAULT 0,
-    reward_score       FLOAT   NOT NULL DEFAULT 0,
+    reward_score       FLOAT   NOT NULL DEFAULT 0,   -- RenTech RL score (vol+winrate+pnl)
     -- LLM reasoning (for display)
     alpha_reasoning    TEXT,
     cro_reasoning      TEXT,

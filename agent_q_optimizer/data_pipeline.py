@@ -32,10 +32,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
 # Must match Rust COIN_CONFIGS tick_size values
 TICK_SIZES: Dict[str, float] = {
-    "ADAFDUSD":  0.0001,
-    "DOTFDUSD":  0.001,
-    "DOGEFDUSD": 0.00001,
+    "SOLFDUSD":  0.01,
     "XRPFDUSD":  0.0001,
+    "DOGEFDUSD": 0.00001,
+    "ETHFDUSD":  0.01,
+    "BNBFDUSD":  0.1,
 }
 
 WINDOW_SIZE = 300   # ≈5 minutes at 1 sample/second
@@ -245,3 +246,113 @@ def get_state_vector_structured(symbol: str, window_minutes: int = 5) -> dict:
 def fetch_telemetry_window(symbol: str, window_minutes: int = 15) -> str:
     """Backward-compat shim — delegates to get_state_vector()."""
     return get_state_vector(symbol, window_minutes=window_minutes)
+
+
+# ── RL Hyper-Cadence Reward Function (PRD §4) ─────────────────────────────────
+
+def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> float:
+    """
+    RenTech-Style Cadence Reward Function.
+
+    Priority 1: Volume  — target 100 round trips per 15m cycle.
+                          Exponential penalty below 100, logarithmic bonus above.
+    Priority 2: Win Rate — (win_rate - 0.5) * 100  → range [-50, +50]
+    Priority 3: PnL      — net_pnl * 10 (weighted multiplier)
+
+    Examples:
+      10 trades, 60% WR, +$0.12 PnL  → volume=-81.0 + wr=+10.0 + pnl=+1.2 = -69.8
+      90 trades, 60% WR, +$0.12 PnL  → volume= -1.0 + wr=+10.0 + pnl=+1.2 =  +10.2
+     100 trades, 55% WR, +$0.50 PnL  → volume=  0.0 + wr= +5.0 + pnl=+5.0 =  +10.0
+     120 trades, 55% WR, +$0.80 PnL  → volume=+4.1 + wr= +5.0 + pnl=+8.0 =  +17.1
+    """
+    import math
+    target_trades = 100.0
+
+    # 1. Volume Score — brutal punishment for < 100 trades
+    if round_trips < target_trades:
+        volume_score = -100.0 * ((1.0 - (round_trips / target_trades)) ** 2)
+    else:
+        volume_score = 50.0 * math.log10(1 + (round_trips - target_trades))
+
+    # 2. Win Rate Score — centred on 50%
+    win_rate_score = (win_rate - 0.5) * 100.0
+
+    # 3. PnL Score
+    pnl_score = net_pnl * 10.0
+
+    return volume_score + win_rate_score + pnl_score
+
+
+def get_rl_metrics_for_symbol(symbol: str, window_minutes: int = 15) -> dict:
+    """
+    Query trade_telemetry for the most recent `window_minutes` window and return:
+      - round_trips   : number of completed round trips (pairs of BUY+SELL fills)
+      - win_rate      : fraction of round trips with net_pnl > 0  (0.0–1.0)
+      - net_pnl       : total net PnL in USD over the window
+    Used by parameter_tuner.py to compute T-1 RL reward.
+    """
+    try:
+        conn = psycopg2.connect(DB_DSN, connect_timeout=5)
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                                  AS total_fills,
+                    SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)            AS winners,
+                    COALESCE(SUM(net_pnl), 0.0)                              AS net_pnl
+                FROM  trade_telemetry
+                WHERE engine_id  = 'D'
+                  AND asset_pair = %s
+                  AND timestamp  >= NOW() - INTERVAL %s
+            """, (symbol, f"{window_minutes} minutes"))
+            row = cur.fetchone()
+        conn.close()
+
+        total     = int(row["total_fills"] or 0)
+        winners   = int(row["winners"]     or 0)
+        net_pnl   = float(row["net_pnl"]   or 0.0)
+        # Each round trip = 1 BUY fill + 1 SELL fill → total_fills / 2
+        round_trips = total // 2
+        win_rate    = (winners / total) if total > 0 else 0.0
+        return {
+            "round_trips": round_trips,
+            "win_rate":    win_rate,
+            "net_pnl":     net_pnl,
+        }
+    except Exception as e:
+        log.error("[%s] RL metrics query failed: %s", symbol, e)
+        return {"round_trips": 0, "win_rate": 0.0, "net_pnl": 0.0}
+
+
+def get_last_cycle_reward_string(symbol: str) -> str:
+    """
+    Return the most recent evaluated agent_q_memory row for `symbol` as a
+    human-readable string for injection into the Alpha LLM prompt.
+
+    Returns a default 'No history yet' string when the table is empty.
+    """
+    try:
+        conn = psycopg2.connect(DB_DSN, connect_timeout=5)
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT reward_score, total_round_trips, win_rate_pct, net_pnl
+                FROM   agent_q_memory
+                WHERE  symbol       = %s
+                  AND  evaluated_at IS NOT NULL
+                ORDER  BY evaluated_at DESC
+                LIMIT  1
+            """, (symbol,))
+            row = cur.fetchone()
+        conn.close()
+
+        if row:
+            sign = "+" if row["net_pnl"] >= 0 else ""
+            wr   = row["win_rate_pct"] or 0.0
+            return (
+                f"Reward: {row['reward_score']:.1f} | "
+                f"Trades: {row['total_round_trips']} | "
+                f"Win Rate: {wr:.0f}% | "
+                f"PnL: {sign}${row['net_pnl']:.2f}"
+            )
+    except Exception as e:
+        log.warning("[%s] Last cycle reward query failed: %s", symbol, e)
+    return "No history yet — first cycle."

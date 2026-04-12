@@ -83,14 +83,20 @@ def call_regime_classifier(stats_str: str) -> str:
 
 # ── Tactical Agents ───────────────────────────────────────────────────────────
 
-def call_agent_1_alpha(stats_str: str, current_regime: str = "MEAN_REVERTING") -> str:
+def call_agent_1_alpha(
+    stats_str: str,
+    current_regime: str = "MEAN_REVERTING",
+    last_cycle_memory: str = "No history yet — first cycle.",
+) -> str:
     """
     Alpha Quant (Stage 1): propose parameters tailored for current_regime.
+    Injects T-1 RL reward memory so the LLM can self-correct on low-volume cycles.
     Runs on MODEL_1 — returns raw LLM text with proposed_gamma / spread / tfi.
     """
-    system = _load_prompt("agent_1_alpha.txt")
+    system = _load_prompt("agent_1_alpha.txt", last_cycle_memory=last_cycle_memory)
     user   = (
         f"CURRENT_REGIME: {current_regime}\n"
+        f"T-1 MEMORY: {last_cycle_memory}\n"
         f"MARKET_TELEMETRY_15MIN: {stats_str}\n\n"
         "Propose optimal parameters for this regime. Respond with JSON only."
     )

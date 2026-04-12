@@ -142,6 +142,11 @@ pub struct HFTEngine {
     /// Number of bookTicker ticks processed (warm-up gate: ≥ 20).
     pub warm_ticks: u64,
 
+    /// Ticks held in long inventory — Stale Inventory Dump gate (PRD §5).
+    /// Resets to 0 on every BUY fill or when inventory drops to flat.
+    /// If > 600 (~60 seconds), profit floor is surrendered to free frozen capital.
+    pub ticks_held: u64,
+
     // ── TFI ring buffer (zero-allocation) ────────────────────────────────────
     tfi_vols: [f64; TFI_CAP],
     tfi_ts:   [u64; TFI_CAP],
@@ -181,6 +186,7 @@ impl HFTEngine {
             pnl_usd:          0.0,
             total_trades:     0,
             warm_ticks:       0,
+            ticks_held:       0,
             tfi_vols: [0.0; TFI_CAP],
             tfi_ts:   [0;   TFI_CAP],
             tfi_sign: [0;   TFI_CAP],
@@ -229,9 +235,11 @@ impl HFTEngine {
             self.inventory_coin += qty;
             self.pnl_usd        -= notional + fee_usd;
             self.last_fill_price = price;
+            self.ticks_held      = 0;   // fresh fill — reset stale counter
         } else {
             self.inventory_coin -= qty;
             self.pnl_usd        += notional - fee_usd;
+            self.ticks_held      = 0;   // sold — back to flat, reset counter
         }
         self.total_trades += 1;
     }
@@ -317,9 +325,22 @@ impl HFTEngine {
         } else if self.inventory_coin >= self.lot_step {
             // STRICT EXIT MODE: we hold ≥1 lot — only sell, never buy.
             // Prevents multi-tranche accumulation and inventory amnesia loops.
+
+            // ── Stale Inventory Dump (PRD §5) ────────────────────────────────
+            // Track ticks held. If > 600 (~60 seconds of order book activity),
+            // surrender the profit floor so AS math can dump at break-even or
+            // micro-loss to instantly free frozen capital for the next cycle.
+            self.ticks_held += 1;
+            let min_profit_price = if self.ticks_held > 600 {
+                0.0  // Surrender floor — accept break-even / micro-loss for velocity
+            } else {
+                self.last_fill_price + self.tick_size  // Target 1-tick pure profit
+            };
             self.open_bid = None;
-            self.open_ask = Some(optimal_ask);
+            self.open_ask = Some(optimal_ask.max(min_profit_price));
         } else {
+            // FLAT — reset stale inventory counter, enter acquisition mode.
+            self.ticks_held = 0;
             // STRICT ACQUISITION MODE: we are flat — only buy, never sell.
             let aggressive_spread = spread_delta * 0.8; // 20% tighter to ensure fill
             let bid_price = reservation_price - aggressive_spread;

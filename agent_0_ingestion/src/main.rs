@@ -4,11 +4,11 @@
 //! Each coin gets its own HFTEngine instance with correct exchange physics.
 //! A single order_manager task handles all REST execution, keyed by symbol.
 //!
-//! Pairs: BTCFDUSD · ADAFDUSD · DOTFDUSD · DOGEFDUSD · XRPFDUSD
+//! Pairs: SOLFDUSD · XRPFDUSD · DOGEFDUSD · ETHFDUSD · BNBFDUSD
 //!
 //! WSS stream routing:
-//!   msg["stream"] = "btcfdusd@depth@100ms"  → symbol="BTCFDUSD", type="depth"
-//!   msg["stream"] = "adafdusd@aggTrade"      → symbol="ADAFDUSD", type="aggTrade"
+//!   msg["stream"] = "solfdusd@depth@100ms"   → symbol="SOLFDUSD",  type="depth"
+//!   msg["stream"] = "xrpfdusd@aggTrade"      → symbol="XRPFDUSD",  type="aggTrade"
 //!   msg["stream"] = "dogefdusd@bookTicker"   → symbol="DOGEFDUSD", type="bookTicker"
 //!
 //! Redis key schema (per-coin):
@@ -87,10 +87,11 @@ struct CoinConfig {
 }
 
 const COIN_CONFIGS: &[CoinConfig] = &[
-    CoinConfig { symbol: "ADAFDUSD",  stream_prefix: "adafdusd",  tick_size: 0.0001,  lot_step: 0.1,     max_inventory: 50.0,    coin_asset: "ADA"  },
-    CoinConfig { symbol: "DOTFDUSD",  stream_prefix: "dotfdusd",  tick_size: 0.001,   lot_step: 0.01,    max_inventory: 3.5,     coin_asset: "DOT"  },
-    CoinConfig { symbol: "DOGEFDUSD", stream_prefix: "dogefdusd", tick_size: 0.00001, lot_step: 1.0,     max_inventory: 180.0,   coin_asset: "DOGE" },
-    CoinConfig { symbol: "XRPFDUSD",  stream_prefix: "xrpfdusd",  tick_size: 0.0001,  lot_step: 1.0,     max_inventory: 45.0,    coin_asset: "XRP"  },
+    CoinConfig { symbol: "SOLFDUSD",  stream_prefix: "solfdusd",  tick_size: 0.01,    lot_step: 0.01,  max_inventory: 2.0,    coin_asset: "SOL"  },
+    CoinConfig { symbol: "XRPFDUSD",  stream_prefix: "xrpfdusd",  tick_size: 0.0001,  lot_step: 1.0,   max_inventory: 45.0,   coin_asset: "XRP"  },
+    CoinConfig { symbol: "DOGEFDUSD", stream_prefix: "dogefdusd", tick_size: 0.00001, lot_step: 1.0,   max_inventory: 180.0,  coin_asset: "DOGE" },
+    CoinConfig { symbol: "ETHFDUSD",  stream_prefix: "ethfdusd",  tick_size: 0.01,    lot_step: 0.001, max_inventory: 0.05,   coin_asset: "ETH"  },
+    CoinConfig { symbol: "BNBFDUSD",  stream_prefix: "bnbfdusd",  tick_size: 0.1,     lot_step: 0.01,  max_inventory: 0.5,    coin_asset: "BNB"  },
 ];
 
 // ── WebSocket URL builder ─────────────────────────────────────────────────────

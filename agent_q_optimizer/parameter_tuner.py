@@ -26,7 +26,9 @@ import time
 import psycopg2
 import psycopg2.extras
 
-from data_pipeline    import fetch_telemetry_window, get_state_vector_structured
+from data_pipeline    import (fetch_telemetry_window, get_state_vector_structured,
+                              get_rl_metrics_for_symbol, calculate_rl_reward,
+                              get_last_cycle_reward_string)
 from lm_studio_client import call_agent_1_alpha, call_agent_2_risk
 from json_sanitizer   import extract_json
 from redis_bridge     import publish_params, publish_safe_mode, get_current_regime
@@ -138,14 +140,15 @@ def _log_decision(
                 RETURNING id
             """, (
                 symbol, regime, gamma, min_spread, tfi_threshold,
-                metrics.get("vol_bps", 0),
-                metrics.get("tfi_zscore", 0),
-                metrics.get("drift_bps", 0),
-                metrics.get("native_spread", 0),
+                metrics.get("vol_bps",      0),
+                metrics.get("tfi_zscore",   0),
+                metrics.get("drift_bps",    0),
+                metrics.get("native_spread",0),
                 alpha_reasoning[:500] if alpha_reasoning else None,
                 cro_reasoning[:500]   if cro_reasoning   else None,
                 override_applied,
             ))
+            # Note: total_round_trips and win_rate_pct are back-filled by _evaluate_reward
             mem_id = cur.fetchone()[0]
         conn.commit()
         conn.close()
@@ -188,28 +191,34 @@ def _evaluate_reward(mem_id: int, symbol: str) -> None:
             """, (symbol, decision_ts, decision_ts))
             res = cur.fetchone()
 
-            net_pnl  = float(res["net_pnl"]      if res else 0)
-            adv_pct  = float(res["adverse_pct"]   if res else 0)
+            net_pnl  = float(res["net_pnl"]    if res else 0)
+            adv_pct  = float(res["adverse_pct"] if res else 0)
 
-            # PRD §5B: Reward = Net PnL - Adverse Selection Penalty
-            # AQ > 60% = heavily punished, AQ < 30% = rewarded
-            aq_penalty   = max(0.0, (adv_pct - 30.0) * 0.5)  # penalty ramps above 30%
-            reward_score = net_pnl - aq_penalty
+            # ── RL Hyper-Cadence Reward (PRD §4) ─────────────────────────────
+            # Get round trips + win rate for the 15m window after this decision
+            rl_metrics  = get_rl_metrics_for_symbol(symbol, window_minutes=15)
+            round_trips = rl_metrics["round_trips"]
+            win_rate    = rl_metrics["win_rate"]
+            win_rate_pct = win_rate * 100.0
+
+            reward_score = calculate_rl_reward(round_trips, win_rate, net_pnl)
 
             cur.execute("""
                 UPDATE agent_q_memory
-                SET    net_pnl          = %s,
-                       adverse_selection = %s,
-                       reward_score     = %s,
-                       evaluated_at     = NOW()
+                SET    total_round_trips  = %s,
+                       win_rate_pct       = %s,
+                       net_pnl            = %s,
+                       adverse_selection  = %s,
+                       reward_score       = %s,
+                       evaluated_at       = NOW()
                 WHERE  id = %s
-            """, (net_pnl, adv_pct, reward_score, mem_id))
+            """, (round_trips, win_rate_pct, net_pnl, adv_pct, reward_score, mem_id))
 
         conn.commit()
         conn.close()
         log.info(
-            "[%s] Reward evaluated for id=%d: PnL=%.4f AQ=%.1f%% score=%.4f",
-            symbol, mem_id, net_pnl, adv_pct, reward_score,
+            "[%s] RL Reward id=%d: trips=%d win=%.0f%% PnL=%.4f score=%.2f",
+            symbol, mem_id, round_trips, win_rate_pct, net_pnl, reward_score,
         )
     except Exception as exc:
         log.error("[%s] Reward evaluation failed for id=%d: %s", symbol, mem_id, exc)
@@ -258,6 +267,10 @@ def tune_parameters_for_symbol(symbol: str) -> None:
     metrics   = get_state_vector_structured(symbol, window_minutes=15)
     log.info("[%s] Tactical telemetry: %s", symbol, stats_str)
 
+    # Step 1b: [RL] Get T-1 cycle reward string for Alpha prompt injection
+    last_cycle_memory = get_last_cycle_reward_string(symbol)
+    log.info("[%s] T-1 RL memory: %s", symbol, last_cycle_memory)
+
     # Step 2: [V2] Retrieve RAG memory for this regime
     rag_block = _retrieve_rag_memory(symbol, current_regime)
     if rag_block:
@@ -266,8 +279,12 @@ def tune_parameters_for_symbol(symbol: str) -> None:
     else:
         stats_str_with_rag = stats_str
 
-    # Step 3: Alpha Quant — regime-aware proposal with RAG context
-    raw_alpha  = call_agent_1_alpha(stats_str_with_rag, current_regime=current_regime)
+    # Step 3: Alpha Quant — regime-aware proposal with RAG context + T-1 RL memory
+    raw_alpha  = call_agent_1_alpha(
+        stats_str_with_rag,
+        current_regime=current_regime,
+        last_cycle_memory=last_cycle_memory,
+    )
     log.info("[%s] Agent-1 raw (%.120s\u2026)", symbol, raw_alpha)
     alpha_dict = extract_json(raw_alpha)
     alpha_reasoning = alpha_dict.get("reasoning", "")
