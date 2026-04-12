@@ -226,9 +226,62 @@ def _evaluate_reward(mem_id: int, symbol: str) -> None:
 
 # ── Background reward evaluator (runs every 60s) ─────────────────────────────
 
+def _recover_orphaned_rewards() -> None:
+    """
+    Startup sweep — re-queue any agent_q_memory rows that are un-evaluated
+    and whose 15-minute window has already closed (or is about to close).
+
+    This handles the case where agent_q restarted before _reward_evaluator_loop
+    could fire: the in-memory queue was lost but the DB rows remain PENDING.
+
+    Rows whose window has NOT closed yet (timestamp > NOW() - 15m) are also
+    re-queued so they still get scored after the remaining wait.
+    """
+    try:
+        conn = _get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, symbol, timestamp
+                FROM   agent_q_memory
+                WHERE  evaluated_at IS NULL
+                ORDER  BY timestamp ASC
+            """)
+            rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            log.info("Reward recovery: no orphaned PENDING rows.")
+            return
+
+        import datetime
+        now_wall = time.monotonic()
+        now_utc  = datetime.datetime.now(datetime.timezone.utc)
+        recover_count = 0
+        with _reward_lock:
+            already = {mid for (mid, _, _) in _reward_queue}
+            for (mem_id, symbol, ts) in rows:
+                if mem_id in already:
+                    continue
+                # How many seconds remain until 15m after the decision?
+                age_s    = (now_utc - ts).total_seconds()
+                wait_s   = max(0.0, 15 * 60 - age_s)
+                eval_after = now_wall + wait_s
+                _reward_queue.append((mem_id, symbol, eval_after))
+                recover_count += 1
+                log.info(
+                    "Reward recovery: id=%d [%s] age=%.0fs → eval in %.0fs",
+                    mem_id, symbol, age_s, wait_s,
+                )
+        if recover_count:
+            log.info("Reward recovery: re-queued %d orphaned row(s).", recover_count)
+    except Exception as exc:
+        log.warning("Reward recovery sweep failed: %s", exc)
+
+
 def _reward_evaluator_loop() -> None:
     """Daemon thread — continuously checks the pending queue for entries ready to score."""
     log.info("Reward evaluator started.")
+    _recover_orphaned_rewards()   # ← re-queue anything lost across restarts
     while True:
         time.sleep(60)
         now = time.monotonic()
