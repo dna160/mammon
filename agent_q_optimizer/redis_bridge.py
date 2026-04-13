@@ -68,7 +68,8 @@ def publish_params(symbol: str, cro_output: dict) -> None:
     payload = {
         "gamma":            float(cro_output.get("final_gamma",            0.8)),
         "min_spread_ticks": float(cro_output.get("final_min_spread_ticks", 10.0)),
-        "tfi_threshold":    float(cro_output.get("final_tfi_threshold",    1.5)),
+        "tfi_threshold":    float(cro_output.get("final_tfi_threshold",    65_000.0)),
+        "obi_threshold":    float(cro_output.get("final_obi_threshold",    1.0)),
         "system_status":    "LIVE",
     }
     r = _get_redis()
@@ -89,6 +90,7 @@ def publish_safe_mode(symbol: str) -> None:
         "gamma":            0.9,
         "min_spread_ticks": 20.0,
         "tfi_threshold":    0.1,
+        "obi_threshold":    0.3,   # Conservative in safe mode — only buy during uptrends
         "system_status":    "SAFE_MODE_LOCKDOWN",
     }
     r = _get_redis()

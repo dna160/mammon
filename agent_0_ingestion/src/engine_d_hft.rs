@@ -29,10 +29,16 @@
 /// EWMA decay α for HF variance (≈ 100-tick half-life).
 const ALPHA: f64 = 0.01;
 
-// Default values for the live engine parameters (overridable via Agent Q every 15m).
-const DEFAULT_LIVE_GAMMA:         f64 = 0.8;
-const DEFAULT_LIVE_MIN_SPREAD:    f64 = 5.0;
-const DEFAULT_LIVE_TFI_THRESHOLD: f64 = 65_000.0; // USD notional — safe default until Agent Q sets it
+// Default values for the live engine parameters (overridable via Agent Q every 1m).
+const DEFAULT_LIVE_GAMMA:          f64 = 0.8;
+const DEFAULT_LIVE_MIN_SPREAD:     f64 = 5.0;
+const DEFAULT_LIVE_TFI_THRESHOLD:  f64 = 65_000.0; // USD notional — safe default until Agent Q sets it
+/// OBI momentum shield — 1.0 = fully permissive (buy in any OBI). Agent Q tightens downward.
+const DEFAULT_LIVE_OBI_THRESHOLD:  f64 = 1.0;
+
+/// Mirror of binance_rest::MIN_NOTIONAL — minimum FDUSD to place/hold a sell order.
+/// Kept in sync manually; engine uses it to detect dust traps without cross-module dep.
+const MIN_NOTIONAL_USD: f64 = 5.0;
 
 // ── Market Regime (injected by Oracle every 5m) ───────────────────────────────
 
@@ -52,8 +58,9 @@ pub enum MarketRegime {
     ToxicLiquidationCascade,
 }
 
-/// Panic stop-loss threshold: 0.15% drawdown below last fill price.
-const PANIC_DRAWDOWN: f64 = 0.9985;
+// PANIC_DRAWDOWN removed — price-based stop-loss caused guaranteed losses
+// (fired 14 ticks below fill while iron profit floor only needs 1 tick up).
+// Stale inventory dump (ticks_held > 600) handles graceful exits instead.
 
 /// Fixed-size ring buffer for TFI rolling window (zero-allocation).
 const TFI_CAP: usize = 512;
@@ -85,7 +92,7 @@ pub struct TickOutput {
     pub total_trades:      u64,
     pub fill_this_tick:    Option<FillSide>,
     pub warm_ticks:        u64,
-    /// True when micro_price drops 0.15% below last_fill_price with long inventory.
+    /// True when ToxicLiquidationCascade regime is active with long inventory.
     pub is_panic:          bool,
 }
 
@@ -106,13 +113,18 @@ pub struct HFTEngine {
     /// Current market regime — drives which sides are quoted.
     pub current_regime: MarketRegime,
 
-    // ── Agent Q Tactical (every 15m) — live math parameters ──────────────────
+    // ── Agent Q Tactical (every 1m) — live math parameters ───────────────────
     /// Risk-aversion γ — reservation-price skew and spread width.
     pub live_gamma:          f64,
     /// Minimum spread in ticks — latency defense buffer.
     pub live_min_spread:     f64,
     /// TFI threshold — coin/s above which toxic flow is considered extreme.
     pub live_tfi_threshold:  f64,
+    /// OBI momentum shield — Agent Q dynamically controls how much sell pressure
+    /// we tolerate before pulling bids. Range [0.0, 1.0].
+    /// safe_to_buy  = obi > -live_obi_threshold  (1.0 = permissive, 0.1 = conservative)
+    /// safe_to_sell = obi <  live_obi_threshold
+    pub live_obi_threshold:  f64,
 
     // ── Engine state ──────────────────────────────────────────────────────────
     /// Net coin inventory.  Positive = long, negative = short.
@@ -173,10 +185,11 @@ impl HFTEngine {
             tick_size,
             lot_step,
             max_inventory_coin,
-            current_regime:    MarketRegime::MeanReverting,
-            live_gamma:        DEFAULT_LIVE_GAMMA,
-            live_min_spread:   DEFAULT_LIVE_MIN_SPREAD,
+            current_regime:     MarketRegime::MeanReverting,
+            live_gamma:         DEFAULT_LIVE_GAMMA,
+            live_min_spread:    DEFAULT_LIVE_MIN_SPREAD,
             live_tfi_threshold: DEFAULT_LIVE_TFI_THRESHOLD,
+            live_obi_threshold: DEFAULT_LIVE_OBI_THRESHOLD,
             inventory_coin:   0.0,
             variance:         0.0,
             last_micro_price: 0.0,
@@ -195,13 +208,14 @@ impl HFTEngine {
         }
     }
 
-    /// Apply Agent Q Tactical parameters (every 15m) injected via Redis.
+    /// Apply Agent Q Tactical parameters (every 1m) injected via Redis.
     ///
     /// Called from the main thread between ticks — no locking needed.
-    pub fn update_params(&mut self, gamma: f64, min_spread: f64, tfi_threshold: f64) {
-        self.live_gamma        = gamma.clamp(0.1, 1.0);
-        self.live_min_spread   = min_spread.clamp(5.0, 50.0);
-        self.live_tfi_threshold = tfi_threshold.clamp(200.0, 150_000.0); // USD notional bounds (PRD §4)
+    pub fn update_params(&mut self, gamma: f64, min_spread: f64, tfi_threshold: f64, obi_threshold: f64) {
+        self.live_gamma         = gamma.clamp(0.1, 1.0);
+        self.live_min_spread    = min_spread.clamp(5.0, 50.0);
+        self.live_tfi_threshold = tfi_threshold.clamp(200.0, 150_000.0); // USD notional bounds
+        self.live_obi_threshold = obi_threshold.clamp(0.0, 1.0);         // OBI shield [0=conservative, 1=permissive]
     }
 
     /// Apply Agent Q Oracle regime (every 5m) injected via Redis.
@@ -311,8 +325,17 @@ impl HFTEngine {
         let optimal_bid = snap(reservation_price - spread_delta);
         let optimal_ask = snap(reservation_price + spread_delta);
 
-        // ── Execution: TFI Shield → Strict Ping-Pong ─────────────────────────
+        // ── Execution: TFI Shield → Dust Recovery → Strict Ping-Pong ────────
         let warmed = self.warm_ticks >= 20;
+
+        // OBI momentum shield — Agent Q controls tolerance for sell pressure.
+        // safe_to_buy:  obi > -threshold  (1.0=permissive, 0.1=only buy uptrends)
+        // safe_to_sell: obi <  threshold  (always true at default 1.0)
+        let safe_to_buy  = obi > -self.live_obi_threshold.abs();
+        let safe_to_sell = obi <  self.live_obi_threshold.abs();
+
+        // Current inventory notional value — used for MIN_NOTIONAL dust check.
+        let current_notional = self.inventory_coin * micro_price;
 
         if !warmed {
             // Gate: not enough ticks to trust variance estimate.
@@ -322,8 +345,22 @@ impl HFTEngine {
             // TFI Toxic Flow Shield — outermost guard, overrides everything.
             self.open_bid = None;
             self.open_ask = None;
+        } else if self.inventory_coin > 0.0 && current_notional < MIN_NOTIONAL_USD {
+            // ── DUST TRAP RECOVERY MODE ───────────────────────────────────────
+            // We hold a partial fill below Binance's $5.00 MIN_NOTIONAL.
+            // Selling is mathematically forbidden — we MUST accumulate more to
+            // push over the $5.10 threshold before attempting an Ask.
+            self.ticks_held += 1; // still holding, count time
+            if safe_to_buy {
+                // Bid aggressively at best_bid to fill fast.
+                self.open_bid = Some(best_bid);
+            } else {
+                // OBI shield: market is dumping too hard — wait, don't compound.
+                self.open_bid = None;
+            }
+            self.open_ask = None;
         } else if self.inventory_coin >= self.lot_step {
-            // STRICT EXIT MODE: we hold ≥1 lot — only sell, never buy.
+            // STRICT EXIT MODE: we hold ≥1 lot and notional ≥ $5.00 — only sell.
             // Prevents multi-tranche accumulation and inventory amnesia loops.
 
             // ── Stale Inventory Dump (PRD §5) ────────────────────────────────
@@ -337,25 +374,36 @@ impl HFTEngine {
                 self.last_fill_price + self.tick_size  // Target 1-tick pure profit
             };
             self.open_bid = None;
-            self.open_ask = Some(optimal_ask.max(min_profit_price));
+            // OBI gate on sells: skip if extreme buy pressure (OBI too high).
+            // At default obi_threshold=1.0 this is always true (safe_to_sell = obi < 1.0).
+            self.open_ask = if safe_to_sell {
+                Some(optimal_ask.max(min_profit_price))
+            } else {
+                Some(optimal_ask.max(min_profit_price)) // Always exit — sell regardless of OBI
+            };
         } else {
             // FLAT — reset stale inventory counter, enter acquisition mode.
             self.ticks_held = 0;
             // STRICT ACQUISITION MODE: we are flat — only buy, never sell.
             let aggressive_spread = spread_delta * 0.8; // 20% tighter to ensure fill
             let bid_price = reservation_price - aggressive_spread;
-            self.open_bid = Some((bid_price / self.tick_size).round() * self.tick_size);
+            if safe_to_buy {
+                self.open_bid = Some((bid_price / self.tick_size).round() * self.tick_size);
+            } else {
+                // Agent Q momentum shield: OBI too negative — pulling bids.
+                self.open_bid = None;
+            }
             self.open_ask = None;
         }
 
         // ── Panic Stop-Loss ───────────────────────────────────────────────────
-        // Triggers on: (a) price drawdown below last fill, or
-        //              (b) ToxicLiquidationCascade regime with long inventory.
-        let is_panic = self.inventory_coin > 0.0 && (
-            (self.last_fill_price > 0.0 &&
-             micro_price < self.last_fill_price * PANIC_DRAWDOWN) ||
-            self.current_regime == MarketRegime::ToxicLiquidationCascade
-        );
+        // ONLY fires on ToxicLiquidationCascade regime.
+        // Price-based drawdown condition removed — it bypassed the iron profit
+        // floor at a 14:1 adverse risk:reward ratio (for DOGE at $0.09, it fired
+        // 14 ticks below fill while the floor only needs 1 tick above fill).
+        // Normal exits handled by: iron profit floor + stale dump (ticks_held > 600).
+        let is_panic = self.inventory_coin > 0.0 &&
+            self.current_regime == MarketRegime::ToxicLiquidationCascade;
 
         TickOutput {
             micro_price,

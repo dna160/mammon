@@ -5,7 +5,8 @@
 //! Price/qty formatting is driven by the caller-supplied tick_size / lot_step.
 //!
 //! Zero-fee guarantee: ALL limit orders use type=LIMIT_MAKER (post-only).
-//! Panic stop-loss uses type=MARKET (taker) — only fires on 0.15% drawdown.
+//! If the order would cross the spread, Binance rejects it — no accidental Taker fills.
+//! Emergency MARKET SELL only fires on ToxicLiquidationCascade regime (not price-based).
 
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};

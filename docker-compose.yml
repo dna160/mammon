@@ -140,7 +140,7 @@ services:
       LM_STUDIO_MODEL_2:   llama-3.2-3b-instruct:2  # Agent 2 CRO (auditing, runs in parallel)
       ACTIVE_SYMBOLS:      SOLFDUSD,XRPFDUSD,DOGEFDUSD,ETHFDUSD,BNBFDUSD
       ORACLE_INTERVAL_S:   "300"    # Oracle regime classifier — every 5 min
-      TACTICAL_INTERVAL_S: "900"    # Tactical parameter tuner — every 15 min
+      TACTICAL_INTERVAL_S: "60"     # Tactical parameter tuner — every 1 min
       PYTHONUNBUFFERED:    "1"
     depends_on:
       redis:

@@ -37,12 +37,16 @@ use tracing::{error, info, warn};
 
 // ── Agent Q message types ─────────────────────────────────────────────────────
 
-/// Tactical parameters injected every 15 minutes by the Parameter Tuner.
+/// Tactical parameters injected every 1 minute by the Parameter Tuner.
 #[derive(Debug, Deserialize)]
 struct AgentQParams {
     gamma:            f64,
     min_spread_ticks: f64,
     tfi_threshold:    f64,
+    /// OBI momentum shield [0.0–1.0]. 1.0 = permissive (any OBI), 0.1 = uptrends only.
+    /// Optional — older payloads without this field default to 1.0 (fully permissive).
+    #[serde(default)]
+    obi_threshold:    Option<f64>,
     #[allow(dead_code)]
     system_status:    Option<String>,
 }
@@ -137,6 +141,10 @@ struct CoinState {
     real_pnl_usd:     f64,
     real_inventory:   f64,
     real_total_trades: u64,
+    /// Running FDUSD cost basis of current inventory (fees included).
+    /// Updated on every BUY fill; reduced proportionally on every SELL.
+    /// Used to compute realised PnL = sell_notional - proportional_cost - sell_fee.
+    cost_basis_usd:   f64,
 }
 
 impl CoinState {
@@ -157,6 +165,7 @@ impl CoinState {
             real_pnl_usd:      0.0,
             real_inventory:    0.0,
             real_total_trades: 0,
+            cost_basis_usd:    0.0,
         }
     }
 }
@@ -181,27 +190,72 @@ fn moved_enough(new_price: f64, old_price: f64, tick_size: f64) -> bool {
 
 // ── Order manager task ────────────────────────────────────────────────────────
 
-/// Spawn a non-blocking PostgreSQL INSERT for a confirmed Engine D trade fill.
-/// Called from the order_manager after each fill; never blocks the hot path.
+/// Spawn non-blocking PostgreSQL INSERTs for a confirmed Engine D trade fill.
+/// Writes to BOTH execution_log (primary — full schema for dashboard + AgentQ)
+/// and trade_telemetry (legacy — kept for backward compat).
+/// Called from the order_manager after each UDS fill; never blocks the hot path.
+///
+/// `trade_pnl` is the REALISED PnL for this specific fill, pre-computed by the caller:
+///   BUY  → 0.0  (position opened, cost tracked in cost_basis_usd — PnL unrealised)
+///   SELL → (sell_price - avg_buy_price) * qty - sell_fee  (round-trip profit/loss)
+#[allow(clippy::too_many_arguments)]
 fn spawn_telemetry_insert(
-    db:        Arc<tokio_postgres::Client>,
-    symbol:    String,
-    notional:  f64,
-    is_buyer:  bool,
-    fee:       f64,
+    db:          Arc<tokio_postgres::Client>,
+    symbol:      String,
+    side:        String,    // "BUY" | "SELL"
+    fill_price:  f64,
+    fill_qty:    f64,
+    notional:    f64,
+    fee:         f64,
+    trade_pnl:   f64,      // realised PnL: 0 for BUY, round-trip profit for SELL
+    order_id:    i64,
+    trade_id:    i64,
 ) {
     tokio::spawn(async move {
-        let gross_pnl = if is_buyer { -notional } else { notional };
-        let net_pnl   = if is_buyer { -(notional + fee) } else { notional - fee };
-        let roe_pct   = (net_pnl / 28.0) * 100.0;
+        let is_buyer  = side == "BUY";
+        let pp_state: i16 = if is_buyer { 0 } else { 1 }; // 0=entering, 1=exiting
+        let roe_pct   = (trade_pnl / notional.max(0.001)) * 100.0;
+
+        // ── execution_log: full schema — used by dashboard trade log + AgentQ ──
+        // tokio_postgres sends f64 as FLOAT8; numeric(20,8) columns reject that.
+        // Pass numeric values as text strings and let PostgreSQL cast TEXT→NUMERIC.
+        let fp_s  = format!("{:.8}", fill_price);
+        let fq_s  = format!("{:.8}", fill_qty);
+        let not_s = format!("{:.8}", notional);
+        let fee_s = format!("{:.8}", fee);
+        let pnl_s = format!("{:.8}", trade_pnl);
+        let rp_s  = format!("{:.8}", roe_pct);
+        if let Err(e) = db.execute(
+            "INSERT INTO execution_log \
+             (timestamp, symbol, side, fill_price, fill_qty, notional_usd, \
+              fee_usd, net_pnl_usd, ping_pong_state, order_id, trade_id) \
+             VALUES (NOW(), $1, $2, $3::text::numeric, $4::text::numeric, $5::text::numeric, \
+                     $6::text::numeric, $7::text::numeric, $8, $9, $10)",
+            &[
+                &symbol,
+                &side,
+                &fp_s,
+                &fq_s,
+                &not_s,
+                &fee_s,
+                &pnl_s,
+                &pp_state,
+                &order_id,
+                &trade_id,
+            ],
+        ).await {
+            warn!("[{}] execution_log INSERT failed: {}", symbol, e);
+        }
+
+        // ── trade_telemetry: legacy table ────────────────────────────────────
         if let Err(e) = db.execute(
             "INSERT INTO trade_telemetry \
              (timestamp, engine_id, asset_pair, trade_size_idr, entry_signal_value, \
               gross_pnl, fees_paid, net_pnl, trade_roe_pct) \
-             VALUES (NOW(), 'D', $1, $2, $3, $4, $5, $6, $7)",
-            &[&symbol, &notional, &fee, &gross_pnl, &fee, &net_pnl, &roe_pct],
+             VALUES (NOW(), 'D', $1, $2::text::numeric, $3::text::numeric, $4::text::numeric, $5::text::numeric, $6::text::numeric, $7::text::numeric)",
+            &[&symbol, &not_s, &fee_s, &pnl_s, &fee_s, &pnl_s, &rp_s],
         ).await {
-            warn!("[{}] Telemetry INSERT failed: {}", symbol, e);
+            warn!("[{}] trade_telemetry INSERT failed: {}", symbol, e);
         }
     });
 }
@@ -327,11 +381,36 @@ async fn order_manager(
                     let is_buyer = report.side == "BUY";
                     let notional = filled_price * filled_qty;
 
-                    // Update Shadow Ledger instantly
+                    // ── Compute realised PnL BEFORE updating inventory/cost_basis ──
+                    // BUY:  PnL = 0 (position opened — realised only on close)
+                    // SELL: PnL = (sell_price - avg_buy_price) * qty - sell_fee
+                    //   avg_buy_price = cost_basis / current_inventory
+                    //   If cost_basis = 0 (seeded inventory from a prior session),
+                    //   avg_buy_price = 0; PnL will show gross proceeds for that tranche.
+                    let trade_pnl = if is_buyer {
+                        0.0
+                    } else {
+                        let avg_buy_price = if s.real_inventory > 0.0 {
+                            s.cost_basis_usd / s.real_inventory
+                        } else {
+                            0.0
+                        };
+                        (filled_price - avg_buy_price) * filled_qty - fee
+                    };
+
+                    // Update cost basis and running PnL
                     if is_buyer {
+                        s.cost_basis_usd += notional + fee;        // track total cost incl. fees
                         s.real_inventory += filled_qty;
                         s.real_pnl_usd   -= notional + fee;
                     } else {
+                        // Reduce cost basis proportionally to qty sold
+                        let cost_of_sold = if s.real_inventory > 0.0 {
+                            (s.cost_basis_usd / s.real_inventory) * filled_qty
+                        } else {
+                            0.0
+                        };
+                        s.cost_basis_usd  = (s.cost_basis_usd - cost_of_sold).max(0.0);
                         s.real_inventory -= filled_qty;
                         s.real_pnl_usd   += notional - fee;
                     }
@@ -354,9 +433,9 @@ async fn order_manager(
                     let _ = fill_tx.try_send((symbol.clone(), is_buyer, filled_price, filled_qty, fee));
 
                     info!(
-                        "[{}][UDS FILL] {} {:.8} @ {:.8} | pnl={:.2} | inv={:+.8}",
+                        "[{}][UDS FILL] {} {:.8} @ {:.8} | trade_pnl={:+.4} | cumulative_pnl={:.2} | inv={:+.8}",
                         symbol, report.side, filled_qty, filled_price,
-                        s.real_pnl_usd, s.real_inventory
+                        trade_pnl, s.real_pnl_usd, s.real_inventory
                     );
 
                     // Log to Redis & Postgres
@@ -368,7 +447,18 @@ async fn order_manager(
                     );
                     let key = format!("engine_d:{}:last_fill", symbol);
                     let _ = redis_con.set::<_, _, ()>(&key, &fp).await;
-                    spawn_telemetry_insert(Arc::clone(&db), symbol, notional, is_buyer, fee);
+                    spawn_telemetry_insert(
+                        Arc::clone(&db),
+                        symbol,
+                        report.side.clone(),
+                        filled_price,
+                        filled_qty,
+                        notional,
+                        fee,
+                        trade_pnl,
+                        report.order_id,
+                        report.trade_id,
+                    );
                 }
                 continue;
             }
@@ -461,10 +551,20 @@ async fn order_manager(
                     if sell_qty >= s.lot_step && notional >= binance_rest::MIN_NOTIONAL {
                         match client.place_limit_order(&symbol, "SELL", ask_price, sell_qty, s.tick_size, s.lot_step).await {
                             Ok(id) => { s.ask_id = Some(id); s.last_ask = ask_price; s.last_requote = Instant::now(); }
-                            Err(e) => warn!("[{}] SkewAsk place skipped: {}", symbol, e),
+                            Err(e) => {
+                                // Clear ask_id on any error (including -1013 MIN_NOTIONAL) so the
+                                // engine doesn't lock up thinking an order is live when it isn't.
+                                s.ask_id = None;
+                                s.last_ask = 0.0;
+                                warn!("[{}] SkewAsk place failed (ask_id cleared): {}", symbol, e);
+                            }
                         }
                     } else {
-                        warn!("[{}] SkewAsk insufficient inventory: real={:.8}", symbol, s.real_inventory);
+                        // Dust below MIN_NOTIONAL — engine state machine will switch to
+                        // DUST_RECOVERY mode and bid to top up inventory over $5.00.
+                        warn!("[{}] SkewAsk dust trap: notional={:.4} < MIN_NOTIONAL — recovery mode active", symbol, notional);
+                        s.ask_id = None;
+                        s.last_ask = 0.0;
                     }
                 }
             }
@@ -509,7 +609,11 @@ async fn order_manager(
                     if sell_qty >= s.lot_step && notional >= binance_rest::MIN_NOTIONAL {
                         match client.place_limit_order(&symbol, "SELL", ask_price, sell_qty, s.tick_size, s.lot_step).await {
                             Ok(id) => { s.ask_id = Some(id); s.last_ask = ask_price; }
-                            Err(e) => warn!("[{}] Requote ask skipped: {}", symbol, e),
+                            Err(e) => {
+                                // Clear ask_id on error — prevents phantom-order lockup.
+                                s.ask_id = None; s.last_ask = 0.0;
+                                warn!("[{}] Requote ask failed (ask_id cleared): {}", symbol, e);
+                            }
                         }
                     } else {
                         warn!("[{}] Requote ask insufficient inventory: real={:.8}", symbol, s.real_inventory);
@@ -844,10 +948,11 @@ async fn stream_loop(
                     if let Some(eng) = engines.get_mut(&sym) {
                         match msg {
                             AgentQMessage::Params(p) => {
-                                eng.update_params(p.gamma, p.min_spread_ticks, p.tfi_threshold);
+                                let obi = p.obi_threshold.unwrap_or(1.0);
+                                eng.update_params(p.gamma, p.min_spread_ticks, p.tfi_threshold, obi);
                                 info!(
-                                    "[{}][AgentQ-Tactical] γ={:.2} spread={:.1} tfi={:.2} status={:?}",
-                                    sym, p.gamma, p.min_spread_ticks, p.tfi_threshold, p.system_status
+                                    "[{}][AgentQ-Tactical] γ={:.2} spread={:.1} tfi={:.0} obi={:.2} status={:?}",
+                                    sym, p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, p.system_status
                                 );
                             }
                             AgentQMessage::Regime(r) => {
@@ -1141,14 +1246,19 @@ async fn main() -> Result<()> {
                                         msg = reader.next() => {
                                             match msg {
                                                 Some(Ok(Message::Text(text))) => {
-                                                    // Step 3: Deserialize executionReport
-                                                    if let Ok(report) = serde_json::from_str::<ExecutionReport>(&text) {
-                                                        if report.event_type == "executionReport"
-                                                            && (report.order_status == "FILLED"
-                                                                || report.order_status == "PARTIALLY_FILLED")
-                                                        {
-                                                            // Step 4: forward to order_manager → real_inventory
-                                                            let _ = uds_tx.send(report).await;
+                                                    // Fast-path: only parse if event type matches.
+                                                    if text.contains("\"executionReport\"") {
+                                                        match serde_json::from_str::<ExecutionReport>(&text) {
+                                                            Ok(report) => {
+                                                                if report.order_status == "FILLED"
+                                                                    || report.order_status == "PARTIALLY_FILLED"
+                                                                {
+                                                                    let _ = uds_tx.send(report).await;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("[UDS-stream] executionReport parse fail: {} | raw={:.300}", e, &text);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1175,22 +1285,33 @@ async fn main() -> Result<()> {
                     }
 
                     // ──────────────────────────────────────────────────────────
-                    // Step 2 FALLBACK: WebSocket API (ws-api.binance.com)
-                    //   Used when REST endpoint is blocked by regional routing.
-                    //   userDataStream.start → listenKey, subscribe → events.
+                    // Step 2 FALLBACK: WS-API to get listenKey → stream.binance.com
+                    //
+                    // When REST /api/v3/userDataStream is blocked (HTTP 410 / ISP):
+                    //   1. Use WS API (ws-api.binance.com) to obtain listenKey only.
+                    //   2. Then connect to stream.binance.com/ws/<listenKey> for events.
+                    //
+                    // IMPORTANT: ws-api.binance.com is a request-response API and does
+                    // NOT push executionReport events itself.  All user data stream events
+                    // come exclusively from stream.binance.com — so we reuse the primary
+                    // stream path (Step 2 PRIMARY) once we have the listenKey.
                     // ──────────────────────────────────────────────────────────
                     UdsMode::WsApi => {
-                        match connect_async(WS_API_URL).await {
+                        // ── Phase A: Obtain listenKey + keep WS-API alive for pings ──
+                        // Per Binance docs: listenKey expires after 60 min without ping.
+                        // REST PUT /api/v3/userDataStream is blocked (HTTP 410).
+                        // Solution: Keep the WS-API connection open; send
+                        //           userDataStream.ping every 30 min via it.
+                        let (listen_key, mut api_writer) = match connect_async(WS_API_URL).await {
                             Err(e) => {
                                 warn!("[UDS] WS-API connect failed: {} — retrying in 5s…", e);
                                 sleep(Duration::from_secs(5)).await;
                                 continue;
                             }
                             Ok((ws_stream, _)) => {
-                                info!("[UDS] WebSocket API connected (fallback path).");
+                                info!("[UDS] WebSocket API connected.");
                                 let (mut writer, mut reader) = ws_stream.split();
 
-                                // Obtain listenKey via WS API
                                 let start_req = serde_json::json!({
                                     "id": "uds-start", "method": "userDataStream.start",
                                     "params": { "apiKey": uds_client.api_key() }
@@ -1200,77 +1321,124 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                let listen_key = {
-                                    let mut key = None;
-                                    while let Some(Ok(Message::Text(text))) = reader.next().await {
-                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                            if v["id"] == "uds-start" {
-                                                if v["status"] == 200 {
-                                                    key = v["result"]["listenKey"].as_str().map(String::from);
-                                                } else {
-                                                    warn!("[UDS] WS-API start error: {}", text);
+                                let mut key = None;
+                                // Drain messages until we see uds-start response
+                                loop {
+                                    match reader.next().await {
+                                        Some(Ok(Message::Text(text))) => {
+                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                                if v["id"] == "uds-start" {
+                                                    if v["status"] == 200 {
+                                                        key = v["result"]["listenKey"].as_str().map(String::from);
+                                                    } else {
+                                                        warn!("[UDS] WS-API start error: {}", text);
+                                                    }
+                                                    break;
                                                 }
-                                                break;
                                             }
                                         }
+                                        _ => break,
                                     }
-                                    key
-                                };
-
-                                let listen_key = match listen_key {
-                                    Some(k) => { info!("[UDS] listenKey obtained via WebSocket API (fallback)."); k }
-                                    None => { sleep(Duration::from_secs(5)).await; continue; }
-                                };
-
-                                // Subscribe
-                                let sub_req = serde_json::json!({
-                                    "id": "uds-subscribe", "method": "userDataStream.subscribe",
-                                    "params": { "listenKey": &listen_key }
-                                }).to_string();
-                                if writer.send(Message::Text(sub_req)).await.is_err() {
-                                    sleep(Duration::from_secs(5)).await;
-                                    continue;
                                 }
-                                info!("[UDS] WebSocket API subscribed — listening for executionReports.");
+                                // Keep writer alive — we use it for keepalive pings.
+                                // Drop reader (we don't need it — stream events come from stream.binance.com).
+                                match key {
+                                    Some(k) => (k, writer),
+                                    None    => { sleep(Duration::from_secs(5)).await; continue; }
+                                }
+                            }
+                        };
+                        info!("[UDS] listenKey obtained via WS-API. Connecting stream.binance.com…");
 
-                                let mut ping_timer =
+                        // ── Phase B: Stream events from stream.binance.com ────
+                        let stream_url = format!("wss://stream.binance.com:9443/ws/{}", listen_key);
+                        info!("[UDS] Connecting stream endpoint (WS-API key): wss://stream.binance.com:9443/ws/<key>");
+
+                        match connect_async(&stream_url).await {
+                            Err(e) => {
+                                warn!("[UDS] stream.binance.com connect failed (WS-API key): {} — retrying in 5s…", e);
+                                sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Ok((ws_stream, _)) => {
+                                info!("[UDS] stream.binance.com connected (WS-API key) — listening for executionReports.");
+                                let (mut writer, mut reader) = ws_stream.split();
+
+                                // Keepalive: send userDataStream.ping on WS-API every 30 min.
+                                // listenKey expires after 60 min — 30 min interval is safe.
+                                let mut keepalive_timer =
                                     tokio::time::interval(Duration::from_secs(30 * 60));
-                                ping_timer.tick().await;
+                                keepalive_timer.tick().await;
 
-                                'wsapi: loop {
+                                'wsapi_stream: loop {
                                     tokio::select! {
-                                        _ = ping_timer.tick() => {
+                                        _ = keepalive_timer.tick() => {
+                                            // Send userDataStream.ping on WS-API to extend listenKey.
                                             let ping_req = serde_json::json!({
-                                                "id": "uds-ping", "method": "userDataStream.ping",
-                                                "params": { "listenKey": &listen_key }
+                                                "id": "uds-ping",
+                                                "method": "userDataStream.ping",
+                                                "params": {
+                                                    "listenKey": &listen_key,
+                                                    "apiKey":    uds_client.api_key()
+                                                }
                                             }).to_string();
-                                            if writer.send(Message::Text(ping_req)).await.is_err() {
-                                                break 'wsapi;
+                                            match api_writer.send(Message::Text(ping_req)).await {
+                                                Ok(()) => info!("[UDS] listenKey keepalive sent via WS-API."),
+                                                Err(e) => {
+                                                    warn!("[UDS] WS-API ping failed: {} — reconnecting for fresh key.", e);
+                                                    break 'wsapi_stream;
+                                                }
                                             }
-                                            info!("[UDS] WS-API ping sent.");
                                         }
                                         msg = reader.next() => {
                                             match msg {
                                                 Some(Ok(Message::Text(text))) => {
-                                                    if text.contains("\"id\"") { continue 'wsapi; }
-                                                    // Step 3: Deserialize executionReport
-                                                    if let Ok(report) = serde_json::from_str::<ExecutionReport>(&text) {
-                                                        if report.event_type == "executionReport"
-                                                            && (report.order_status == "FILLED"
-                                                                || report.order_status == "PARTIALLY_FILLED")
-                                                        {
-                                                            // Step 4: forward to order_manager → real_inventory
-                                                            let _ = uds_tx.send(report).await;
+                                                    // Parse as Value first to handle both direct and wrapped formats.
+                                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                                        // Support direct {"e":"executionReport",...}
+                                                        // and wrapped {"subscriptionId":0,"event":{...}} formats.
+                                                        let etype = v.get("e")
+                                                            .or_else(|| v.get("event").and_then(|ev| ev.get("e")))
+                                                            .and_then(|e| e.as_str())
+                                                            .unwrap_or("");
+
+                                                        if etype == "executionReport" {
+                                                            // Try direct parse, then wrapped format.
+                                                            let report_res = serde_json::from_str::<ExecutionReport>(&text)
+                                                                .or_else(|_| {
+                                                                    v.get("event")
+                                                                        .ok_or_else(|| serde_json::from_str::<ExecutionReport>("").unwrap_err())
+                                                                        .and_then(|ev| serde_json::from_value::<ExecutionReport>(ev.clone()))
+                                                                });
+                                                            match report_res {
+                                                                Ok(report) => {
+                                                                    if report.order_status == "FILLED"
+                                                                        || report.order_status == "PARTIALLY_FILLED"
+                                                                    {
+                                                                        info!("[UDS] executionReport FILLED: sym={} side={} qty={} @ {}",
+                                                                            report.symbol, report.side,
+                                                                            report.last_filled_qty, report.last_filled_price);
+                                                                        let _ = uds_tx.send(report).await;
+                                                                    }
+                                                                    // NEW/CANCELED silently ignored — not fills
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("[UDS] executionReport parse fail: {} | raw={}", e, &text);
+                                                                }
+                                                            }
                                                         }
+                                                        // outboundAccountPosition, balanceUpdate, listStatus silently ignored
                                                     }
                                                 }
-                                                Some(Ok(Message::Ping(d))) => { let _ = writer.send(Message::Pong(d)).await; }
+                                                Some(Ok(Message::Ping(d))) => {
+                                                    let _ = writer.send(Message::Pong(d)).await;
+                                                }
                                                 Some(Ok(Message::Close(_))) | None => {
-                                                    tracing::error!("CRITICAL: User Data Stream (WS-API) disconnected! Forcing process exit for Docker restart.");
+                                                    tracing::error!("CRITICAL: User Data Stream (WS-API key) disconnected! Forcing process exit.");
                                                     std::process::exit(1);
                                                 }
                                                 Some(Err(e)) => {
-                                                    tracing::error!("CRITICAL: UDS WS-API error: {} — forcing process exit for Docker restart.", e);
+                                                    tracing::error!("CRITICAL: UDS WS-API stream error: {} — forcing process exit.", e);
                                                     std::process::exit(1);
                                                 }
                                                 _ => {}

@@ -207,30 +207,31 @@ async function getKpis() {
   try {
     const result = await pool.query(`
       SELECT
-        COUNT(*)::int                      AS daily_trades,
-        COALESCE(SUM(trade_roe_pct), 0)   AS daily_roe,
-        COALESCE(SUM(net_pnl), 0)         AS total_net_pnl,
-        COALESCE(AVG(net_pnl), 0)         AS avg_pnl_per_trade,
+        COUNT(*)::int                                   AS daily_trades,
+        COALESCE(SUM(net_pnl_usd), 0)                 AS total_net_pnl,
+        COALESCE(AVG(net_pnl_usd), 0)                 AS avg_pnl_per_trade,
         COALESCE(
-          100.0 * SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)::float
+          100.0 * SUM(CASE WHEN net_pnl_usd > 0 THEN 1 ELSE 0 END)::float
           / NULLIF(COUNT(*), 0),
           0
-        )                                  AS win_rate_pct
-      FROM trade_telemetry
-      WHERE engine_id = 'D'
-        AND timestamp > NOW() - INTERVAL '24 hours'
+        )                                               AS win_rate_pct,
+        -- Round trips = completed sell fills (each sell closes a buy position)
+        COUNT(*) FILTER (WHERE side = 'SELL')::int      AS round_trips
+      FROM execution_log
+      WHERE timestamp > NOW() - INTERVAL '24 hours'
     `);
     const r = result.rows[0] || {};
     return {
       daily_trades:      r.daily_trades      || 0,
-      daily_roe:         parseFloat(r.daily_roe)         || 0,
+      daily_roe:         0,
       total_net_pnl:     parseFloat(r.total_net_pnl)     || 0,
       avg_pnl_per_trade: parseFloat(r.avg_pnl_per_trade) || 0,
       win_rate_pct:      parseFloat(r.win_rate_pct)      || 0,
+      round_trips:       r.round_trips       || 0,
     };
   } catch (e) {
     console.error('[KPIs] query error:', e.message);
-    return { daily_trades: 0, daily_roe: 0, total_net_pnl: 0, avg_pnl_per_trade: 0, win_rate_pct: 0 };
+    return { daily_trades: 0, daily_roe: 0, total_net_pnl: 0, avg_pnl_per_trade: 0, win_rate_pct: 0, round_trips: 0 };
   }
 }
 
@@ -238,18 +239,20 @@ async function getTrades(limit = 100) {
   try {
     const result = await pool.query(`
       SELECT
-        trade_id::text,
+        id::text            AS trade_id,
         timestamp,
-        engine_id,
-        asset_pair,
-        trade_size_idr,
-        entry_signal_value,
-        gross_pnl,
-        fees_paid,
-        net_pnl,
-        trade_roe_pct
-      FROM trade_telemetry
-      WHERE engine_id = 'D'
+        symbol,
+        side,
+        fill_price,
+        fill_qty,
+        notional_usd,
+        fee_usd,
+        net_pnl_usd,
+        ping_pong_state,
+        regime,
+        order_id,
+        trade_id            AS exchange_trade_id
+      FROM execution_log
       ORDER BY timestamp DESC
       LIMIT $1
     `, [limit]);
@@ -264,15 +267,14 @@ async function getChart() {
   try {
     const result = await pool.query(`
       SELECT
-        date_trunc('minute', timestamp)  AS bucket,
-        COALESCE(SUM(net_pnl), 0)        AS period_pnl,
-        SUM(SUM(net_pnl)) OVER (
+        date_trunc('minute', timestamp)      AS bucket,
+        COALESCE(SUM(net_pnl_usd), 0)       AS period_pnl,
+        SUM(SUM(net_pnl_usd)) OVER (
           ORDER BY date_trunc('minute', timestamp)
           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        )                                AS cumulative_pnl
-      FROM trade_telemetry
-      WHERE engine_id = 'D'
-        AND timestamp > NOW() - INTERVAL '24 hours'
+        )                                    AS cumulative_pnl
+      FROM execution_log
+      WHERE timestamp > NOW() - INTERVAL '24 hours'
       GROUP BY bucket
       ORDER BY bucket ASC
     `);

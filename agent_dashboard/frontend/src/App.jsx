@@ -739,12 +739,18 @@ function KpiBar({ kpis }) {
 
 // ── Trade Log ─────────────────────────────────────────────────────────────────
 
-const TH = ['Time', 'Symbol', 'Pair', 'Signal', 'Size', 'Gross PnL', 'Fees', 'Net PnL', 'ROE %'];
+const TH = ['Time', 'Pair', 'Side', 'Fill Price', 'Qty', 'Notional', 'Fee', 'Net PnL', 'ROE %'];
 
 function TradeRow({ trade }) {
-  const net  = parseFloat(trade.net_pnl       ?? 0);
-  const roe  = parseFloat(trade.trade_roe_pct ?? 0);
-  const meta = COIN_META[trade.asset_pair] ?? { color: C.blue };
+  const net      = parseFloat(trade.net_pnl_usd  ?? 0);
+  const notional = parseFloat(trade.notional_usd  ?? 0);
+  const fee      = parseFloat(trade.fee_usd        ?? 0);
+  const price    = parseFloat(trade.fill_price     ?? 0);
+  const qty      = parseFloat(trade.fill_qty       ?? 0);
+  const roe      = notional > 0 ? (net / notional) * 100 : 0;
+  const meta     = COIN_META[trade.symbol] ?? { coin: trade.symbol, color: C.blue };
+  const isBuy    = trade.side === 'BUY';
+
   return (
     <tr
       className="border-b hover:opacity-90 transition-opacity"
@@ -754,36 +760,38 @@ function TradeRow({ trade }) {
         {fmtTime(trade.timestamp)}
       </td>
       <td className="px-3 py-2">
-        <span className="text-xs font-bold px-1.5 py-0.5 rounded"
-          style={{ background: `${C.blue}22`, color: C.blue }}>
-          D
+        <span className="text-xs font-bold" style={{ color: meta.color }}>
+          {meta.coin ?? trade.symbol}
         </span>
       </td>
       <td className="px-3 py-2">
-        <span className="text-xs font-bold" style={{ color: meta.color }}>
-          {trade.asset_pair ?? '—'}
+        <span className="text-xs font-bold px-1.5 py-0.5 rounded"
+          style={{
+            background: isBuy ? `${C.green}22` : `${C.red}22`,
+            color:      isBuy ? C.green         : C.red,
+          }}>
+          {trade.side ?? '—'}
         </span>
       </td>
+      <td className="px-3 py-2 text-xs font-mono" style={{ color: C.text }}>
+        {pp(price, 5)}
+      </td>
       <td className="px-3 py-2 text-xs font-mono" style={{ color: C.muted }}>
-        {pp(trade.entry_signal_value, 5)}
+        {pp(qty, 4)}
       </td>
       <td className="px-3 py-2 text-xs font-mono" style={{ color: C.text }}>
-        {parseFloat(trade.trade_size_idr ?? 0).toFixed(2)}
-      </td>
-      <td className="px-3 py-2 text-xs font-mono font-semibold"
-        style={{ color: parseFloat(trade.gross_pnl ?? 0) >= 0 ? C.green : C.red }}>
-        {ppm(trade.gross_pnl, 4)}
+        {pp(notional, 4)}
       </td>
       <td className="px-3 py-2 text-xs font-mono" style={{ color: C.muted }}>
-        {pp(trade.fees_paid, 4)}
+        {pp(fee, 4)}
       </td>
       <td className="px-3 py-2 text-xs font-mono font-bold"
         style={{ color: net >= 0 ? C.green : C.red }}>
-        {ppm(net, 4)}
+        {isBuy ? '—' : ppm(net, 4)}
       </td>
       <td className="px-3 py-2 text-xs font-mono font-bold"
         style={{ color: roe >= 0 ? C.green : C.red }}>
-        {ppm(roe, 4)}%
+        {isBuy ? '—' : `${ppm(roe, 3)}%`}
       </td>
     </tr>
   );

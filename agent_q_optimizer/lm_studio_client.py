@@ -52,8 +52,23 @@ def _load_prompt(filename: str, **fmt_kwargs) -> str:
     return text
 
 
+def _truncate(text: str, max_chars: int) -> str:
+    """Hard-truncate a string to avoid context window overflow on 3B models."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "…[truncated]"
+
+
 def _chat(client: OpenAI, model_id: str, system: str, user: str) -> str:
-    """Single LLM call with deterministic settings and hard timeout."""
+    """Single LLM call with deterministic settings and hard timeout.
+
+    Total prompt budget for llama-3.2-3b at 2048-token context:
+      ~600 tokens system  + ~400 tokens user  + 512 tokens output = ~1512 tokens.
+    We enforce char limits here so combined input never overflows.
+    """
+    # Hard cap: system ≤ 2000 chars, user ≤ 1200 chars
+    system = _truncate(system, 2000)
+    user   = _truncate(user,   1200)
     response = client.chat.completions.create(
         model=model_id,
         messages=[
@@ -62,8 +77,8 @@ def _chat(client: OpenAI, model_id: str, system: str, user: str) -> str:
         ],
         temperature=0.0,
         top_p=0.1,
-        max_tokens=512,
-        timeout=15.0,
+        max_tokens=256,   # JSON responses are short — 256 is plenty, saves context
+        timeout=20.0,
     )
     return response.choices[0].message.content or ""
 
@@ -118,9 +133,9 @@ def call_agent_2_risk(
     system = _load_prompt("agent_2_risk.txt", current_regime=current_regime)
     user   = (
         f"CURRENT_REGIME: {current_regime}\n"
-        f"MARKET_TELEMETRY_15MIN: {stats_str}\n\n"
+        f"MARKET_TELEMETRY_1MIN: {stats_str}\n\n"
         f"ALPHA_PROPOSAL: {alpha_proposal}\n\n"
-        "Enforce the Dynamic Bounding Matrix and respond with JSON only."
+        "Enforce bounding matrix. JSON only."
     )
     log.debug("[CRO] Calling %s …", MODEL_2)
     return _chat(_get_client2(), MODEL_2, system, user)

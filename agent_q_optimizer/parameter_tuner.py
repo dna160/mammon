@@ -1,20 +1,20 @@
 """
-Parameter Tuner — Agent Q Tactical Loop (every 15 minutes).
+Parameter Tuner — Agent Q Tactical Loop (every 1 minute).
 
 V2 additions per PRD §5 (RAG Memory):
   - Writes each parameter decision to agent_q_memory table before publishing.
   - Retrieves Top 2 / Bottom 2 historical actions for the active regime and
     injects them into the Alpha prompt (Retrieval-Augmented Reflection).
   - A background evaluator thread continuously back-fills net_pnl and
-    reward_score on entries older than 15 minutes (async, never blocks trading).
+    reward_score on entries older than 1 minute (async, never blocks trading).
 
 Pipeline:
   1. Read current regime from Redis (set by Oracle every 5m)
-  2. Query 15-minute telemetry from PostgreSQL
+  2. Query 1-minute telemetry from PostgreSQL
   3. [V2] Retrieve RAG memory for current regime (Top 2 best / Bottom 2 worst)
-  4. Agent 1 (Alpha Quant) — propose gamma/spread with historical context injected
+  4. Agent 1 (Alpha Quant) — propose gamma/spread/obi_threshold with historical context
   5. Agent 2 (CRO)         — enforce Dynamic Bounding Matrix
-  6. [V2] Log decision to agent_q_memory (id returned for 15m reward back-fill)
+  6. [V2] Log decision to agent_q_memory (id returned for 1m reward back-fill)
   7. Publish final params  → hft:live_params:{symbol}
 """
 import json
@@ -87,26 +87,13 @@ def _retrieve_rag_memory(symbol: str, regime: str) -> str:
         if not best and not worst:
             return ""
 
-        lines = [f"\n**YOUR HISTORICAL MEMORY FOR {regime}:**"]
-        if best:
-            lines.append("SUCCESSFUL PAST ACTIONS (REWARDED):")
-            for r in best:
-                lines.append(
-                    f"- Spread: {r['proposed_min_spread']:.1f}, "
-                    f"Gamma: {r['proposed_gamma']:.2f} | "
-                    f"Outcome: {'+' if r['net_pnl'] >= 0 else ''}{r['net_pnl']:.2f} PnL "
-                    f"(AQ: {r['adverse_selection']:.0f}%)"
-                )
-        if worst:
-            lines.append("FAILED PAST ACTIONS (PUNISHED — DO NOT REPEAT):")
-            for r in worst:
-                lines.append(
-                    f"- Spread: {r['proposed_min_spread']:.1f}, "
-                    f"Gamma: {r['proposed_gamma']:.2f} | "
-                    f"Outcome: {'+' if r['net_pnl'] >= 0 else ''}{r['net_pnl']:.2f} PnL "
-                    f"(DANGER AQ: {r['adverse_selection']:.0f}% — DO NOT REPEAT)"
-                )
-        return "\n".join(lines)
+        # Keep RAG block compact — 3B model has limited context (≤150 chars target)
+        lines = [f"MEM[{regime[:4]}]:"]
+        for r in best[:1]:   # Top 1 only
+            lines.append(f"BEST sp={r['proposed_min_spread']:.0f} g={r['proposed_gamma']:.1f} pnl={r['net_pnl']:.3f}")
+        for r in worst[:1]:  # Bottom 1 only
+            lines.append(f"WORST sp={r['proposed_min_spread']:.0f} g={r['proposed_gamma']:.1f} pnl={r['net_pnl']:.3f}")
+        return " | ".join(lines)
 
     except Exception as exc:
         log.warning("[%s] RAG memory retrieval failed: %s", symbol, exc)
@@ -176,18 +163,19 @@ def _evaluate_reward(mem_id: int, symbol: str) -> None:
                 return
             decision_ts = row["timestamp"]
 
-            # Net PnL accumulated in the 15m window after the decision
+            # Net PnL accumulated in the 1m window after the decision
+            # Uses execution_log (primary) — has symbol, net_pnl_usd, side columns.
+            # Adverse selection = % of SELL fills that closed at a loss (net_pnl_usd < 0).
             cur.execute("""
-                SELECT COALESCE(SUM(net_pnl), 0) AS net_pnl,
+                SELECT COALESCE(SUM(net_pnl_usd), 0) AS net_pnl,
                        COALESCE(
-                           100.0 * SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END)
-                           / NULLIF(COUNT(*), 0),
+                           100.0 * COUNT(*) FILTER (WHERE side = 'SELL' AND net_pnl_usd < 0)
+                           / NULLIF(COUNT(*) FILTER (WHERE side = 'SELL'), 0),
                            0
                        ) AS adverse_pct
-                FROM  trade_telemetry
-                WHERE engine_id  = 'D'
-                  AND asset_pair = %s
-                  AND timestamp  BETWEEN %s AND %s + INTERVAL '15 minutes'
+                FROM  execution_log
+                WHERE symbol    = %s
+                  AND timestamp BETWEEN %s AND %s + INTERVAL '1 minutes'
             """, (symbol, decision_ts, decision_ts))
             res = cur.fetchone()
 
@@ -195,8 +183,8 @@ def _evaluate_reward(mem_id: int, symbol: str) -> None:
             adv_pct  = float(res["adverse_pct"] if res else 0)
 
             # ── RL Hyper-Cadence Reward (PRD §4) ─────────────────────────────
-            # Get round trips + win rate for the 15m window after this decision
-            rl_metrics  = get_rl_metrics_for_symbol(symbol, window_minutes=15)
+            # Get round trips + win rate for the 1m window after this decision
+            rl_metrics  = get_rl_metrics_for_symbol(symbol, window_minutes=1)
             round_trips = rl_metrics["round_trips"]
             win_rate    = rl_metrics["win_rate"]
             win_rate_pct = win_rate * 100.0
@@ -262,9 +250,9 @@ def _recover_orphaned_rewards() -> None:
             for (mem_id, symbol, ts) in rows:
                 if mem_id in already:
                     continue
-                # How many seconds remain until 15m after the decision?
+                # How many seconds remain until 1m after the decision?
                 age_s    = (now_utc - ts).total_seconds()
-                wait_s   = max(0.0, 15 * 60 - age_s)
+                wait_s   = max(0.0, 1 * 60 - age_s)
                 eval_after = now_wall + wait_s
                 _reward_queue.append((mem_id, symbol, eval_after))
                 recover_count += 1
@@ -315,9 +303,9 @@ def tune_parameters_for_symbol(symbol: str) -> None:
     current_regime = get_current_regime(symbol)
     log.info("[%s] Active regime: %s", symbol, current_regime)
 
-    # Step 1: 15-minute telemetry + structured metrics
-    stats_str = fetch_telemetry_window(symbol, window_minutes=15)
-    metrics   = get_state_vector_structured(symbol, window_minutes=15)
+    # Step 1: 1-minute telemetry + structured metrics
+    stats_str = fetch_telemetry_window(symbol, window_minutes=1)
+    metrics   = get_state_vector_structured(symbol, window_minutes=1)
     log.info("[%s] Tactical telemetry: %s", symbol, stats_str)
 
     # Step 1b: [RL] Get T-1 cycle reward string for Alpha prompt injection
@@ -372,10 +360,11 @@ def tune_parameters_for_symbol(symbol: str) -> None:
     final_gamma  = float(cro_dict.get("final_gamma",            0.8))
     final_spread = float(cro_dict.get("final_min_spread_ticks", 10.0))
     final_tfi    = float(cro_dict.get("final_tfi_threshold",    65_000.0))
+    final_obi    = float(cro_dict.get("final_obi_threshold",    1.0))    # 1.0 = permissive default
 
     log.info(
-        "[%s] Agent-2: \u03b3=%.2f spread=%.1f tfi=$%.0f override=%s",
-        symbol, final_gamma, final_spread, final_tfi, override_applied,
+        "[%s] Agent-2: \u03b3=%.2f spread=%.1f tfi=$%.0f obi=%.2f override=%s",
+        symbol, final_gamma, final_spread, final_tfi, final_obi, override_applied,
     )
 
     # Step 5: [V2] Log decision to agent_q_memory BEFORE publishing
@@ -391,9 +380,9 @@ def tune_parameters_for_symbol(symbol: str) -> None:
         override_applied = override_applied,
     )
 
-    # Schedule reward back-fill 15 min from now
+    # Schedule reward back-fill 1 min from now
     if mem_id is not None:
-        eval_after = time.monotonic() + 15 * 60
+        eval_after = time.monotonic() + 1 * 60
         with _reward_lock:
             _reward_queue.append((mem_id, symbol, eval_after))
 

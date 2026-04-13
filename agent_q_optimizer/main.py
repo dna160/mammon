@@ -17,11 +17,11 @@ Three loops run concurrently on daemon threads:
     classify macro regime → hft:regime:{symbol}
     Rust engine adopts structural quoting playbook instantly.
 
-  Tactical Loop (every 15 min) — parameter_tuner.py
+  Tactical Loop (every 1 min) — parameter_tuner.py
     Reads active regime from Redis.
     Adversarial Alpha/CRO pipeline with Dynamic Bounding Matrix + RAG memory.
-    Publishes tuned params → hft:live_params:{symbol}.
-    Logs decision to agent_q_memory for 15-min reward back-fill.
+    Publishes tuned params (gamma, spread, tfi, obi_threshold) → hft:live_params:{symbol}.
+    Logs decision to agent_q_memory for 1-min reward back-fill.
 
 Dead-Man's Switch: any unhandled exception in Oracle or Tactical triggers
 SAFE_MODE_LOCKDOWN on all affected symbols.
@@ -43,8 +43,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("agent_q")
 
-ORACLE_INTERVAL_S   = int(os.getenv("ORACLE_INTERVAL_S",   str(5  * 60)))   # 5  min
-TACTICAL_INTERVAL_S = int(os.getenv("TACTICAL_INTERVAL_S", str(15 * 60)))   # 15 min
+ORACLE_INTERVAL_S   = int(os.getenv("ORACLE_INTERVAL_S",   str(5 * 60)))    # 5  min
+TACTICAL_INTERVAL_S = int(os.getenv("TACTICAL_INTERVAL_S", str(1 * 60)))    # 1  min
 WATCHER_INTERVAL_S  = float(os.getenv("WATCHER_INTERVAL_S", "1.0"))         # 1  sec
 
 ACTIVE_SYMBOLS = [
@@ -124,7 +124,7 @@ def oracle_loop() -> None:
         time.sleep(sleep_for)
 
 
-# ── Tactical Loop (every 15 min) ──────────────────────────────────────────────
+# ── Tactical Loop (every 1 min) ───────────────────────────────────────────────
 
 def _run_tactical_cycle() -> None:
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="Tactical") as pool:

@@ -254,16 +254,18 @@ def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> fl
     """
     RenTech-Style Cadence Reward Function.
 
-    Priority 1: Volume  — target 100 round trips per 15m cycle.
-                          Exponential penalty below 100, logarithmic bonus above.
+    Priority 1: Volume   — target 100 round trips per 1m cycle.
+                           Exponential penalty below 100, logarithmic bonus above.
     Priority 2: Win Rate — (win_rate - 0.5) * 100  → range [-50, +50]
-    Priority 3: PnL      — net_pnl * 10 (weighted multiplier)
+    Priority 3: PnL      — Asymmetric: negative PnL × 50 (falling knife penalty),
+                           positive PnL × 10. Forces Agent Q to learn obi_threshold
+                           tuning to avoid adverse selection.
 
-    Examples:
-      10 trades, 60% WR, +$0.12 PnL  → volume=-81.0 + wr=+10.0 + pnl=+1.2 = -69.8
-      90 trades, 60% WR, +$0.12 PnL  → volume= -1.0 + wr=+10.0 + pnl=+1.2 =  +10.2
-     100 trades, 55% WR, +$0.50 PnL  → volume=  0.0 + wr= +5.0 + pnl=+5.0 =  +10.0
-     120 trades, 55% WR, +$0.80 PnL  → volume=+4.1 + wr= +5.0 + pnl=+8.0 =  +17.1
+    Examples (1m cycle):
+       5 trades, 60% WR, +$0.02 PnL  → volume=-81.0 + wr=+10.0 + pnl=+0.2  = -70.8
+      10 trades, 60% WR, +$0.05 PnL  → volume=-64.0 + wr=+10.0 + pnl=+0.5  = -53.5
+      10 trades, 40% WR, -$0.10 PnL  → volume=-64.0 + wr=-10.0 + pnl=-5.0  = -79.0
+     100 trades, 55% WR, +$0.10 PnL  → volume=  0.0 + wr= +5.0 + pnl=+1.0  =  +6.0
     """
     import math
     target_trades = 100.0
@@ -277,42 +279,44 @@ def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> fl
     # 2. Win Rate Score — centred on 50%
     win_rate_score = (win_rate - 0.5) * 100.0
 
-    # 3. PnL Score
-    pnl_score = net_pnl * 10.0
+    # 3. PnL Score — asymmetric punishment for capital bleed (adverse selection)
+    # Negative PnL punished 5× harder to force obi_threshold learning.
+    if net_pnl < 0:
+        pnl_score = net_pnl * 50.0   # Falling knife penalty
+    else:
+        pnl_score = net_pnl * 10.0   # Positive reinforcement
 
     return volume_score + win_rate_score + pnl_score
 
 
-def get_rl_metrics_for_symbol(symbol: str, window_minutes: int = 15) -> dict:
+def get_rl_metrics_for_symbol(symbol: str, window_minutes: int = 1) -> dict:
     """
-    Query trade_telemetry for the most recent `window_minutes` window and return:
-      - round_trips   : number of completed round trips (pairs of BUY+SELL fills)
-      - win_rate      : fraction of round trips with net_pnl > 0  (0.0–1.0)
-      - net_pnl       : total net PnL in USD over the window
+    Query execution_log for the most recent `window_minutes` window and return:
+      - round_trips   : number of completed SELL fills (each closes a BUY position)
+      - win_rate      : fraction of SELL fills with net_pnl_usd > 0  (0.0–1.0)
+      - net_pnl       : total net PnL in USD over the window (all fills)
     Used by parameter_tuner.py to compute T-1 RL reward.
+    Reads from execution_log (primary) which has symbol, side, net_pnl_usd.
     """
     try:
         conn = psycopg2.connect(DB_DSN, connect_timeout=5)
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute("""
                 SELECT
-                    COUNT(*)                                                  AS total_fills,
-                    SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)            AS winners,
-                    COALESCE(SUM(net_pnl), 0.0)                              AS net_pnl
-                FROM  trade_telemetry
-                WHERE engine_id  = 'D'
-                  AND asset_pair = %s
-                  AND timestamp  >= NOW() - INTERVAL %s
+                    COUNT(*) FILTER (WHERE side = 'SELL')                     AS round_trips,
+                    COUNT(*) FILTER (WHERE side = 'SELL' AND net_pnl_usd > 0) AS winners,
+                    COALESCE(SUM(net_pnl_usd), 0.0)                           AS net_pnl
+                FROM  execution_log
+                WHERE symbol    = %s
+                  AND timestamp >= NOW() - INTERVAL %s
             """, (symbol, f"{window_minutes} minutes"))
             row = cur.fetchone()
         conn.close()
 
-        total     = int(row["total_fills"] or 0)
-        winners   = int(row["winners"]     or 0)
-        net_pnl   = float(row["net_pnl"]   or 0.0)
-        # Each round trip = 1 BUY fill + 1 SELL fill → total_fills / 2
-        round_trips = total // 2
-        win_rate    = (winners / total) if total > 0 else 0.0
+        round_trips = int(row["round_trips"] or 0)
+        winners     = int(row["winners"]     or 0)
+        net_pnl     = float(row["net_pnl"]   or 0.0)
+        win_rate    = (winners / round_trips) if round_trips > 0 else 0.0
         return {
             "round_trips": round_trips,
             "win_rate":    win_rate,
