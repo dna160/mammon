@@ -43,6 +43,14 @@ LIMITS: gamma[0.1-1.0], spread[1.0-50.0], tfi[200-200000], obi[0.0-1.0], tranche
 T-1 CYCLE MEMORY (LAST 3 MINS):
 {last_cycle_memory}
 
+CRITICAL ARCHITECTURE — V2.3 TAKER BAILOUT:
+The engine has a 2-minute (~1200 tick) True Taker Bailout. If inventory is held for >1200 ticks
+without a maker exit, the engine fires an emergency MARKET SELL — incurring taker fees AND slippage.
+This is expensive and destroys win rate. If you see Win Rate collapsing or many bailout events,
+your grid_offset_ticks is too TIGHT — the engine averages down in too narrow a band and gets trapped.
+ACTION: Widen grid_offset_ticks to 10+ so the grid catches dip bottoms instead of stacking at the top.
+Do NOT shrink max_active_tranches as a first response — that just starves volume.
+
 CRITICAL: Do not fear micro-losses. High volume offsets micro-losses. Free frozen capital.
 
 Output strict JSON:

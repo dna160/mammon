@@ -478,9 +478,9 @@ function AgentQPanel({ agentQ, rewardHistory, cadence }) {
             />
             <SvRow
               label="7. Engine State"
-              value={`${sv.active_tranches ?? 0}/${sv.applied_max_tranches ?? 1} tranches · ${sv.decision ?? '—'}`}
-              label2={sv.pnl_mtm != null ? (sv.pnl_mtm >= 0 ? 'MTM+' : 'MTM−') : null}
-              color={sv.pnl_mtm >= 0 ? C.green : C.red}
+              value={`${sv.active_tranches ?? 0}/${sv.applied_max_tranches ?? 1} tr · ${sv.decision ?? '—'}${sv.ticks_held > 0 ? ` · ${sv.ticks_held}t held` : ''}`}
+              label2={sv.emergency_dump ? '🚨 BAILOUT' : sv.pnl_mtm != null ? (sv.pnl_mtm >= 0 ? 'MTM+' : 'MTM−') : null}
+              color={sv.emergency_dump ? C.red : sv.pnl_mtm >= 0 ? C.green : C.red}
             />
           </div>
         ) : (
@@ -628,10 +628,14 @@ function HoldingsPanel({ holdings, onResetPnl }) {
                   <span className="text-[10px]" style={{ color: C.muted }}>
                     σ² {h.variance?.toExponential(2) ?? '—'}
                   </span>
-                  {/* Grid geometry row */}
+                  {/* Grid geometry + bailout row */}
                   {h?.grid_offset_ticks != null && (
-                    <span className="text-[10px] font-mono" style={{ color: C.muted }}>
-                      grid {h.grid_offset_ticks?.toFixed(1)}t · {h.max_active_tranches ?? 1} tranches max
+                    <span className="text-[10px] font-mono" style={{ color: h?.emergency_dump ? C.red : C.muted }}>
+                      {h?.emergency_dump
+                        ? '🚨 TAKER BAILOUT'
+                        : h?.ticks_held > 1000
+                        ? `⚠ ${h.ticks_held}t held · grid ${h.grid_offset_ticks?.toFixed(1)}t`
+                        : `grid ${h.grid_offset_ticks?.toFixed(1)}t · ${h.max_active_tranches ?? 1}tr`}
                     </span>
                   )}
                   <span className="text-[10px] font-mono font-bold" style={{ color: pnlDisplay >= 0 ? C.green : C.red }}>

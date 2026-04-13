@@ -1,11 +1,12 @@
 //! Engine D — Avellaneda-Stoikov HFT Market Maker (multi-coin, Binance).
 //!
-//! Mathematical framework (V2.2 — Institutional Math Hardened):
+//! Mathematical framework (V2.3 — Microstructure Skew & True Bailout):
 //!   F1  Micro-Price:    P_micro = (V_ask·P_bid + V_bid·P_ask) / (V_bid + V_ask)
 //!   F2  OBI:            (V_bid − V_ask) / (V_bid + V_ask) ∈ [−1, +1]
 //!   F3  TFI (exp-decay): 5s half-life EWMA — eliminates infinite accumulation bug
 //!   F4  EWMA σ²(t):     α = 1 − exp(−dt/60)  (continuous-time, uncoupled from tick rate)
-//!   F5  Reservation:    r = P_micro − (q_skew · γ · σ²)  [spot-symmetry corrected]
+//!   F5  Reservation:    r = P_micro − (q_skew · γ · σ²) + (OBI × 5 × tick_size)
+//!                       [V2.3: OBI skew warp added — negative OBI lowers bid, positive raises it]
 //!   F6  Spread:         δ = max(tick_size + γ·σ², tick_size · MIN_SPREAD_TICKS)
 //!   F7  Grid:           bid = snap(optimal_bid − active_tranches · tick · grid_offset_ticks)
 //!
@@ -16,9 +17,9 @@
 //!     active_tranches = floor(inventory_notional / $6)
 //!     bid: active_tranches < max_tranches AND safe_to_buy
 //!          → grid-stepped bid (optimal_bid − active_tranches × tick × grid_offset_ticks)
-//!     ask: active_tranches > 0 AND safe_to_sell
-//!          → max(optimal_ask, last_fill + 1 tick)
-//!          → stale >600 ticks: accept break-even (last_fill_price only)
+//!     ask: ticks_held > 1200 → TAKER BAILOUT: fire emergency MARKET SELL (V2.3)
+//!          ticks_held > 600  → accept break-even (last_fill_price only)
+//!          else              → max(optimal_ask, last_fill + 1 tick)
 
 // ── Module-level constants ────────────────────────────────────────────────────
 
@@ -72,9 +73,13 @@ pub struct TickOutput {
     pub inventory_coin:    f64,
     pub pnl_usd:           f64,
     pub total_trades:      u64,
-    pub fill_this_tick:    Option<FillSide>,
-    pub warm_ticks:        u64,
-    pub is_panic:          bool,
+    pub fill_this_tick:            Option<FillSide>,
+    pub warm_ticks:                u64,
+    pub is_panic:                  bool,
+    /// V2.3: set true when ticks_held > 1200 — main.rs must fire a MARKET SELL.
+    pub emergency_dump_triggered:  bool,
+    /// V2.3: ticks held long — exposed for dashboard display.
+    pub ticks_held:                u64,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -123,6 +128,10 @@ pub struct HFTEngine {
     // ── Fix 2: Continuous-Time Variance ──────────────────────────────────────
     /// Timestamp (ms) of last bookTicker — used to compute time-accurate alpha.
     pub last_var_update_ms: u64,
+
+    // ── V2.3: True Taker Bailout ──────────────────────────────────────────────
+    /// Set to true inside tick() when ticks_held > 1200; main.rs catches and fires MARKET SELL.
+    pub emergency_dump_triggered: bool,
 }
 
 impl HFTEngine {
@@ -149,9 +158,10 @@ impl HFTEngine {
             total_trades:          0,
             warm_ticks:            0,
             ticks_held:            0,
-            tfi_rolling_sum:       0.0,
-            last_tfi_update_ms:    0,
-            last_var_update_ms:    0,
+            tfi_rolling_sum:        0.0,
+            last_tfi_update_ms:     0,
+            last_var_update_ms:     0,
+            emergency_dump_triggered: false,
         }
     }
 
@@ -259,16 +269,19 @@ impl HFTEngine {
         let tfi_decay = (-dt_tfi * std::f64::consts::LN_2 / TFI_HALF_LIFE_S).exp();
         let tfi       = self.tfi_rolling_sum * tfi_decay;
 
-        // ── F5: Reservation Price — Spot-Symmetry Corrected (Fix 3) ──────────
+        // ── F5: Reservation Price — Spot-Symmetry Corrected + OBI Skew (V2.3) ─
         // Neutral inventory = MAX/2 (halfway through grid capacity).
         // inventory_risk_skew > 0 → we are over-long → reservation skews lower.
         // inventory_risk_skew < 0 → we are under-long → reservation skews higher.
+        // V2.3 OBI skew: positive OBI (bid-heavy) → warp price up (buy pressure);
+        //                negative OBI (ask-heavy)  → warp price down (sell pressure).
         let neutral_inventory   = self.live_max_tranches as f64
             * (6.00 / micro_price.max(1e-9))
             / 2.0;
         let inventory_risk_skew = self.inventory_coin - neutral_inventory;
+        let obi_price_warp      = obi * 5.0 * self.tick_size;
         let reservation_price   =
-            micro_price - (inventory_risk_skew * self.live_gamma * self.variance);
+            micro_price - (inventory_risk_skew * self.live_gamma * self.variance) + obi_price_warp;
 
         // ── F6: Spread ────────────────────────────────────────────────────────
         let ts           = self.tick_size;
@@ -319,17 +332,30 @@ impl HFTEngine {
                 self.open_bid = None;
             }
 
-            // ── ASK SIDE — Exit Plan & Stale Dump ────────────────────────────
-            if active_tranches > 0 && safe_to_sell {
-                // PRD §5: Stale Inventory Dump
-                //   Normal (≤600 ticks):  demand 1-tick profit floor
-                //   Stale  (>600 ticks):  accept break-even to regain velocity
-                let min_profit_price = if self.ticks_held > 600 {
-                    self.last_fill_price             // break-even: free frozen capital
+            // ── ASK SIDE — Exit Plan, Break-Even & Taker Bailout (V2.3) ─────────
+            // V2.3 True Taker Bailout:
+            //   >1200 ticks (~2 min): capital is trapped — signal emergency MARKET SELL.
+            //                         main.rs catches emergency_dump_triggered and fires
+            //                         place_market_sell() for the full inventory coin.
+            //   >600 ticks:           stale — accept break-even (last_fill_price, no floor).
+            //   else:                 iron profit floor of 1 tick.
+            self.emergency_dump_triggered = false;
+            if active_tranches > 0 {
+                if self.ticks_held > 1200 {
+                    // TAKER BAILOUT: fire market sell signal, cancel both sides.
+                    self.emergency_dump_triggered = true;
+                    self.open_ask = None;
+                    self.open_bid = None;
+                } else if safe_to_sell {
+                    let min_profit_price = if self.ticks_held > 600 {
+                        self.last_fill_price             // break-even: free frozen capital
+                    } else {
+                        self.last_fill_price + ts        // iron profit floor: 1 tick
+                    };
+                    self.open_ask = Some(optimal_ask.max(min_profit_price));
                 } else {
-                    self.last_fill_price + ts        // iron profit floor: 1 tick
-                };
-                self.open_ask = Some(optimal_ask.max(min_profit_price));
+                    self.open_ask = None;
+                }
             } else {
                 self.open_ask = None;
             }
@@ -343,18 +369,20 @@ impl HFTEngine {
             micro_price,
             obi,
             tfi,
-            variance:          self.variance,
+            variance:                  self.variance,
             reservation_price,
             optimal_bid,
             optimal_ask,
-            open_bid:          self.open_bid,
-            open_ask:          self.open_ask,
-            inventory_coin:    self.inventory_coin,
-            pnl_usd:           self.pnl_usd,
-            total_trades:      self.total_trades,
-            fill_this_tick:    None,
-            warm_ticks:        self.warm_ticks,
+            open_bid:                  self.open_bid,
+            open_ask:                  self.open_ask,
+            inventory_coin:            self.inventory_coin,
+            pnl_usd:                   self.pnl_usd,
+            total_trades:              self.total_trades,
+            fill_this_tick:            None,
+            warm_ticks:                self.warm_ticks,
             is_panic,
+            emergency_dump_triggered:  self.emergency_dump_triggered,
+            ticks_held:                self.ticks_held,
         }
     }
 }

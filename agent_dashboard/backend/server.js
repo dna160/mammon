@@ -148,6 +148,9 @@ async function getHoldings() {
           // V2.2: Grid geometry from live engine state
           grid_offset_ticks:   parseFloat(p.grid_offset_ticks ?? 2.0),
           max_active_tranches: parseInt(p.max_active_tranches ?? 1, 10),
+          // V2.3: Taker bailout tracking
+          ticks_held:          parseInt(p.ticks_held ?? 0, 10),
+          emergency_dump:      p.emergency_dump === true || p.emergency_dump === 'true',
           // Telemetry extra fields
           ticks_book:          t ? (t.ticks_book ?? 0) : 0,
           ticks_agg:           t ? (t.ticks_agg  ?? 0) : 0,

@@ -1031,6 +1031,23 @@ async fn stream_loop(
                     continue;
                 }
 
+                // ── V2.3: True Taker Bailout (>1200 ticks / ~2 min trapped) ──
+                if out.emergency_dump_triggered {
+                    let bail_qty = engine.inventory_coin;
+                    if bail_qty > engine.lot_step {
+                        engine.ticks_held      = 0;
+                        engine.open_bid        = None;
+                        engine.open_ask        = None;
+                        warn!(
+                            "[{}] TAKER BAILOUT! ticks_held={} inv={:.8} micro={:.8} — firing MARKET SELL",
+                            symbol, out.ticks_held, bail_qty, out.micro_price
+                        );
+                        let _ = order_tx.try_send(OrderCmd::PanicSell { symbol: symbol.clone(), qty: bail_qty });
+                        if let Some(r) = requested.get_mut(&symbol) { *r = (0.0, 0.0); }
+                        continue;
+                    }
+                }
+
                 let spread   = out.optimal_ask - out.optimal_bid;
                 let decision = if out.warm_ticks < 20 {
                     "WARMING-UP"
@@ -1059,7 +1076,7 @@ async fn stream_loop(
                 }
 
                 let pp = format!(
-                    r#"{{"ts":{},"symbol":"{}","tick":{},"tick_us":{},"warm_ticks":{},"micro_price":{:.8},"lob_bid":{:.8},"lob_ask":{:.8},"obi":{:.6},"tfi":{:.6},"variance":{:.10},"reservation":{:.8},"optimal_bid":{:.8},"optimal_ask":{:.8},"spread":{:.8},"open_bid":{},"open_ask":{},"inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"decision":"{}","grid_offset_ticks":{:.2},"max_active_tranches":{}}}"#,
+                    r#"{{"ts":{},"symbol":"{}","tick":{},"tick_us":{},"warm_ticks":{},"micro_price":{:.8},"lob_bid":{:.8},"lob_ask":{:.8},"obi":{:.6},"tfi":{:.6},"variance":{:.10},"reservation":{:.8},"optimal_bid":{:.8},"optimal_ask":{:.8},"spread":{:.8},"open_bid":{},"open_ask":{},"inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"decision":"{}","grid_offset_ticks":{:.2},"max_active_tranches":{},"ticks_held":{},"emergency_dump":{}}}"#,
                     now_ms, symbol, tb, tick_us, out.warm_ticks,
                     out.micro_price, bid, ask,
                     out.obi, out.tfi, out.variance,
@@ -1069,6 +1086,7 @@ async fn stream_loop(
                     out.open_ask.map(|v| format!("{:.8}", v)).unwrap_or_else(|| "null".into()),
                     out.inventory_coin, out.pnl_usd, out.total_trades, decision,
                     engine.live_grid_offset_ticks, engine.live_max_tranches,
+                    out.ticks_held, out.emergency_dump_triggered,
                 );
                 // Use pre-allocated key (Fix 4: no format! in hot path)
                 let _ = con.set::<_, _, ()>(&coin_keys[&symbol].pipeline, &pp).await;

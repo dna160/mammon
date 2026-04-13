@@ -117,6 +117,8 @@ def _fetch_live_engine_context(symbol: str) -> dict:
         "applied_grid_offset":   2.0,
         "obi_live":              0.0,
         "micro_price":           0.0,
+        "ticks_held":            0,
+        "emergency_dump":        False,
     }
     try:
         r       = _get_redis()
@@ -137,6 +139,8 @@ def _fetch_live_engine_context(symbol: str) -> dict:
         ctx["applied_grid_offset"]  = float(d.get("grid_offset_ticks", 2.0))
         ctx["obi_live"]             = float(d.get("obi", 0.0))
         ctx["micro_price"]          = price
+        ctx["ticks_held"]           = int(d.get("ticks_held", 0))
+        ctx["emergency_dump"]       = bool(d.get("emergency_dump", False))
 
         # Approximate active tranches from inventory notional ($6 per tranche)
         notional = abs(inv) * price
@@ -257,6 +261,8 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
             "active_tranches":       eng_ctx["active_tranches"],
             "applied_max_tranches":  eng_ctx["applied_max_tranches"],
             "applied_grid_offset":   eng_ctx["applied_grid_offset"],
+            "ticks_held":            eng_ctx["ticks_held"],
+            "emergency_dump":        eng_ctx["emergency_dump"],
         }
         r = _get_redis()
         r.set(
@@ -270,12 +276,16 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
     # ── 5. Compressed string for LLM — includes OBI + engine context ─────────
     # Engine context line gives Agent Q situational awareness:
     # Is the engine loaded? Running at what tranche depth? MTM profitable?
+    bailout_flag = " ⚠ TAKER BAILOUT IMMINENT" if eng_ctx["ticks_held"] > 1000 else (
+        " [EMERGENCY DUMP]" if eng_ctx["emergency_dump"] else ""
+    )
     eng_line = (
         f"inv={eng_ctx['inventory_coin']:+.4f} coin | "
         f"pnl_mtm={eng_ctx['pnl_mtm']:+.4f} USD | "
         f"decision={eng_ctx['decision']} | "
         f"tranches={eng_ctx['active_tranches']}/{eng_ctx['applied_max_tranches']} | "
-        f"offset={eng_ctx['applied_grid_offset']:.1f}t"
+        f"offset={eng_ctx['applied_grid_offset']:.1f}t | "
+        f"ticks_held={eng_ctx['ticks_held']}{bailout_flag}"
     )
     return (
         f"[ORACLE 5M STATE VECTOR - {sym}]\n"
