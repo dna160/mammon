@@ -863,11 +863,23 @@ function TradeLog({ trades }) {
 
 // ── Reward History ────────────────────────────────────────────────────────────
 
-function RewardHistory({ data }) {
+function RewardHistory({ data, pendingCount }) {
   const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'TFI', 'Trips /15', 'Win%', 'Net PnL', 'AQ%', 'Score', 'Override'];
 
   return (
-    <Panel title="Agent Q Memory — RAG Reward Scorecard">
+    <Panel
+      title="Agent Q Memory — RAG Reward Scorecard"
+      action={
+        pendingCount > 0 ? (
+          <span
+            className="text-[10px] font-mono px-2 py-0.5 rounded-full animate-pulse"
+            style={{ background: `${C.amber}22`, color: C.amber, border: `1px solid ${C.amber}44` }}
+          >
+            ⏳ {pendingCount} cycle{pendingCount !== 1 ? 's' : ''} evaluating…
+          </span>
+        ) : null
+      }
+    >
       <div className="overflow-auto" style={{ maxHeight: 300 }}>
         <table className="w-full text-left" style={{ minWidth: 860 }}>
           <thead style={{ position: 'sticky', top: 0, background: C.surface2, zIndex: 1 }}>
@@ -884,7 +896,7 @@ function RewardHistory({ data }) {
             {!data?.length ? (
               <tr>
                 <td colSpan={RH.length} className="px-3 py-10 text-center text-sm" style={{ color: C.muted }}>
-                  No agent_q_memory entries yet. First reward evaluated at T+1min…
+                  No evaluated cycles yet. Rewards back-filled 60s after each decision.
                 </td>
               </tr>
             ) : (
@@ -892,12 +904,14 @@ function RewardHistory({ data }) {
                 const score   = parseFloat(r.reward_score ?? 0);
                 const pnl     = parseFloat(r.net_pnl      ?? 0);
                 const aq      = parseFloat(r.adverse_selection ?? 0);
-                const pending = !r.evaluated_at;
+                const trips   = r.total_round_trips ?? 0;
+                const wr      = parseFloat(r.win_rate_pct ?? 0);
                 const regMeta = REGIME_META[r.regime] ?? REGIME_META.UNKNOWN;
+                // All rows from backend are guaranteed evaluated (WHERE evaluated_at IS NOT NULL)
                 return (
                   <tr key={r.id} className="border-b" style={{ borderColor: C.border }}>
                     <td className="px-3 py-2 text-xs font-mono whitespace-nowrap" style={{ color: C.muted }}>
-                      {fmtTime(r.timestamp)}
+                      {fmtTime(r.evaluated_at ?? r.timestamp)}
                     </td>
                     <td className="px-3 py-2 text-xs font-bold" style={{ color: COIN_META[r.symbol]?.color ?? C.blue }}>
                       {COIN_META[r.symbol]?.coin ?? r.symbol}
@@ -915,24 +929,24 @@ function RewardHistory({ data }) {
                       {parseFloat(r.tfi_threshold ?? 0).toLocaleString()}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
-                      style={{ color: pending ? C.muted : (r.total_round_trips ?? 0) >= 15 ? C.green : C.red }}>
-                      {pending ? '—' : (r.total_round_trips ?? 0)}
+                      style={{ color: trips >= 15 ? C.green : trips > 0 ? C.amber : C.red }}>
+                      {trips}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
-                      style={{ color: pending ? C.muted : (r.win_rate_pct ?? 0) >= 50 ? C.green : C.amber }}>
-                      {pending ? '—' : `${pp(r.win_rate_pct, 1)}%`}
+                      style={{ color: wr >= 50 ? C.green : C.amber }}>
+                      {`${pp(wr, 1)}%`}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
-                      style={{ color: pending ? C.muted : pnl >= 0 ? C.green : C.red }}>
-                      {pending ? 'PENDING…' : ppm(pnl, 4)}
+                      style={{ color: pnl >= 0 ? C.green : C.red }}>
+                      {ppm(pnl, 4)}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono"
-                      style={{ color: pending ? C.muted : aq > 60 ? C.red : aq > 40 ? C.amber : C.green }}>
-                      {pending ? '—' : `${pp(aq, 1)}%`}
+                      style={{ color: aq > 60 ? C.red : aq > 40 ? C.amber : C.green }}>
+                      {`${pp(aq, 1)}%`}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
-                      style={{ color: pending ? C.muted : score >= 0 ? C.green : C.red }}>
-                      {pending ? 'PENDING…' : ppm(score, 4)}
+                      style={{ color: score >= 0 ? C.green : C.red }}>
+                      {ppm(score, 1)}
                     </td>
                     <td className="px-3 py-2">
                       {r.override_applied
@@ -953,17 +967,27 @@ function RewardHistory({ data }) {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [snapshot,    setSnapshot]    = useState(null);
-  const [rewardHist,  setRewardHist]  = useState([]);
-  const [wsStatus,    setWsStatus]    = useState('connecting'); // 'connecting' | 'live' | 'error'
-  const [lastUpdate,  setLastUpdate]  = useState(null);
+  const [snapshot,        setSnapshot]        = useState(null);
+  const [rewardHist,      setRewardHist]      = useState([]);
+  const [rewardPending,   setRewardPending]   = useState(0);
+  const [wsStatus,        setWsStatus]        = useState('connecting'); // 'connecting' | 'live' | 'error'
+  const [lastUpdate,      setLastUpdate]      = useState(null);
   const wsRef = useRef(null);
 
   // Reward history — low-frequency REST poll (every 30s)
   const fetchRewardHistory = useCallback(async () => {
     try {
       const res = await fetch('/api/reward-history?limit=50');
-      if (res.ok) setRewardHist(await res.json());
+      if (res.ok) {
+        const body = await res.json();
+        // Backend now returns { rows, pending_count }
+        if (Array.isArray(body)) {
+          setRewardHist(body);
+        } else {
+          if (body.rows)          setRewardHist(body.rows);
+          if (body.pending_count != null) setRewardPending(body.pending_count);
+        }
+      }
     } catch (_) {}
   }, []);
 
@@ -995,6 +1019,7 @@ export default function App() {
           setLastUpdate(Date.now());
           // Reward history is now included in the snapshot push — update inline
           if (parsed.reward_history?.length) setRewardHist(parsed.reward_history);
+          if (parsed.reward_pending_count != null) setRewardPending(parsed.reward_pending_count);
         } catch (_) {}
       };
       ws.onerror = () => setWsStatus('error');
@@ -1127,7 +1152,7 @@ export default function App() {
 
       {/* ── Reward History ── */}
       <div className="px-4 pb-6">
-        <RewardHistory data={rewardHist} />
+        <RewardHistory data={rewardHist} pendingCount={rewardPending} />
       </div>
 
       {/* ── Footer ── */}

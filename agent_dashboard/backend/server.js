@@ -291,22 +291,32 @@ async function getChart() {
 
 async function getRewardHistory(limit = 50) {
   try {
-    const result = await pool.query(`
-      SELECT
-        id, timestamp, evaluated_at, symbol, regime,
-        proposed_gamma, proposed_min_spread, tfi_threshold,
-        vol_bps, tfi_zscore, drift_bps, native_spread,
-        net_pnl, adverse_selection, reward_score,
-        total_round_trips, win_rate_pct,
-        alpha_reasoning, cro_reasoning, override_applied
-      FROM agent_q_memory
-      ORDER BY timestamp DESC
-      LIMIT $1
-    `, [limit]);
-    return result.rows;
+    // Only return evaluated rows (evaluated_at IS NOT NULL) so the scorecard
+    // never shows PENDING placeholders. A separate pending_count is returned
+    // for the UI badge.
+    const [evaluated, pending] = await Promise.all([
+      pool.query(`
+        SELECT
+          id, timestamp, evaluated_at, symbol, regime,
+          proposed_gamma, proposed_min_spread, tfi_threshold,
+          vol_bps, tfi_zscore, drift_bps, native_spread,
+          net_pnl, adverse_selection, reward_score,
+          total_round_trips, win_rate_pct,
+          alpha_reasoning, cro_reasoning, override_applied
+        FROM agent_q_memory
+        WHERE evaluated_at IS NOT NULL
+        ORDER BY evaluated_at DESC
+        LIMIT $1
+      `, [limit]),
+      pool.query(`SELECT COUNT(*)::int AS n FROM agent_q_memory WHERE evaluated_at IS NULL`),
+    ]);
+    return {
+      rows:          evaluated.rows,
+      pending_count: pending.rows[0]?.n ?? 0,
+    };
   } catch (e) {
     console.error('[RewardHistory] query error:', e.message);
-    return [];
+    return { rows: [], pending_count: 0 };
   }
 }
 
@@ -329,17 +339,18 @@ async function getFullSnapshot() {
   });
 
   return {
-    ts:             Date.now(),
+    ts:                    Date.now(),
     kpis,
     trades,
     chart,
     holdings,
     orders,
-    last_fills:     lastFills,
-    agent_q:        agentQ,
-    live_pnl:       livePnl,
-    symbols:        SYMBOLS,
-    reward_history: rewardHistory,
+    last_fills:            lastFills,
+    agent_q:               agentQ,
+    live_pnl:              livePnl,
+    symbols:               SYMBOLS,
+    reward_history:        rewardHistory.rows,
+    reward_pending_count:  rewardHistory.pending_count,
   };
 }
 
@@ -404,7 +415,7 @@ app.get('/api/agent-q', async (_req, res) => {
 
 app.get('/api/reward-history', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit ?? '50', 10), 200);
-  try { res.json(await getRewardHistory(limit)); }
+  try { res.json(await getRewardHistory(limit)); }  // returns { rows, pending_count }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
