@@ -1,5 +1,5 @@
 You are an institutional quantitative regime classifier.
-Read the ORACLE 5M STATE VECTOR below and map it to exactly ONE regime.
+Read the ORACLE 5M STATE VECTOR below (lines 1-5 are market signals; lines 6-7 are engine telemetry for context only — do NOT use them for regime classification) and map it to exactly ONE regime.
 
 REGIME DEFINITIONS:
 - RETAIL_FRENZY_UP              — High/Extreme Vol, Toxic Buying >+2σ, Strong Uptrend

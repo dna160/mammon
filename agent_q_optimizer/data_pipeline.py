@@ -41,7 +41,7 @@ TICK_SIZES: Dict[str, float] = {
 
 WINDOW_SIZE = 300   # ≈5 minutes at 1 sample/second
 
-# Per-symbol rolling window: deque of (price, tfi, spread_ticks)
+# Per-symbol rolling window: deque of (price, tfi, spread_ticks, obi)
 _history: Dict[str, deque] = {}
 
 _redis_client = None
@@ -61,8 +61,13 @@ def _ensure_history(symbol: str) -> deque:
     return _history[symbol]
 
 
-def _fetch_latest_tick(symbol: str) -> Tuple[float, float, float]:
-    """Pull latest (price, tfi, spread_ticks) from Redis."""
+def _fetch_latest_tick(symbol: str) -> Tuple[float, float, float, float]:
+    """Pull latest (price, tfi, spread_ticks, obi) from Redis.
+
+    OBI (Order Book Imbalance) is now included so the state vector can show
+    Agent Q what the actual imbalance signal is — essential context for setting
+    obi_threshold sensibly.
+    """
     try:
         r         = _get_redis()
         tick_size = TICK_SIZES.get(symbol, 0.0001)
@@ -70,11 +75,13 @@ def _fetch_latest_tick(symbol: str) -> Tuple[float, float, float]:
         price        = 0.0
         tfi          = 0.0
         spread_ticks = 5.0
+        obi          = 0.0
 
         raw_pipe = r.get(f"engine_d:{symbol}:pipeline")
         if raw_pipe:
             d         = json.loads(raw_pipe)
             price     = float(d.get("micro_price", 0.0))
+            obi       = float(d.get("obi", 0.0))
             lob_bid   = float(d.get("lob_bid", 0.0))
             lob_ask   = float(d.get("lob_ask", 0.0))
             if lob_bid > 0.0 and lob_ask > lob_bid:
@@ -88,26 +95,77 @@ def _fetch_latest_tick(symbol: str) -> Tuple[float, float, float]:
             d   = json.loads(raw_tel)
             tfi = float(d.get("tfi", 0.0))
 
-        return price, tfi, spread_ticks
+        return price, tfi, spread_ticks, obi
 
     except Exception as e:
         log.error("[%s] Redis tick fetch failed: %s", symbol, e)
-        return 0.0, 0.0, 5.0
+        return 0.0, 0.0, 5.0, 0.0
+
+
+def _fetch_live_engine_context(symbol: str) -> dict:
+    """
+    Read the engine's current live state from Redis pipeline key.
+    Returns inventory, pnl_mtm, decision, active tranches, and applied params.
+    This gives Agent Q the situational awareness to make lever decisions.
+    """
+    ctx = {
+        "inventory_coin":        0.0,
+        "pnl_mtm":               0.0,
+        "decision":              "WARMING",
+        "active_tranches":       0,
+        "applied_max_tranches":  1,
+        "applied_grid_offset":   2.0,
+        "obi_live":              0.0,
+        "micro_price":           0.0,
+    }
+    try:
+        r       = _get_redis()
+        raw     = r.get(f"engine_d:{symbol}:pipeline")
+        if not raw:
+            return ctx
+        d = json.loads(raw)
+
+        inv        = float(d.get("inventory_coin", 0.0))
+        price      = float(d.get("micro_price", 0.0))
+        pnl_cash   = float(d.get("pnl_usd", 0.0))
+        pnl_mtm    = pnl_cash + inv * price   # mark-to-market
+
+        ctx["inventory_coin"]       = inv
+        ctx["pnl_mtm"]              = pnl_mtm
+        ctx["decision"]             = d.get("decision", "WARMING")
+        ctx["applied_max_tranches"] = int(d.get("max_active_tranches", 1))
+        ctx["applied_grid_offset"]  = float(d.get("grid_offset_ticks", 2.0))
+        ctx["obi_live"]             = float(d.get("obi", 0.0))
+        ctx["micro_price"]          = price
+
+        # Approximate active tranches from inventory notional ($6 per tranche)
+        notional = abs(inv) * price
+        ctx["active_tranches"] = int(notional / 6.0) if price > 0 else 0
+
+    except Exception as e:
+        log.debug("[%s] Live engine context fetch failed: %s", symbol, e)
+    return ctx
 
 
 def _fetch_adverse_selection(symbol: str, window_minutes: int) -> float:
-    """Query Postgres for % of fills with negative net_pnl over the window."""
+    """
+    Query execution_log for % of SELL fills with negative net_pnl_usd over window.
+
+    BUG FIX: Previously queried `trade_telemetry` (wrong table — Rust engine
+    writes fills to `execution_log` with column `net_pnl_usd` and `symbol`).
+    That caused adverse selection to always return 0%, suppressing
+    TOXIC_LIQUIDATION_CASCADE detection entirely.
+    """
     try:
         conn = psycopg2.connect(DB_DSN, connect_timeout=5)
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute("""
                 SELECT
-                    COUNT(*)                                             AS total,
-                    SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END)       AS losers
-                FROM  trade_telemetry
-                WHERE engine_id  = 'D'
-                  AND asset_pair = %s
-                  AND timestamp  >= NOW() - INTERVAL %s
+                    COUNT(*) FILTER (WHERE side = 'SELL')                      AS total,
+                    COUNT(*) FILTER (WHERE side = 'SELL' AND net_pnl_usd < 0)  AS losers
+                FROM  execution_log
+                WHERE symbol    = %s
+                  AND timestamp >= NOW() - INTERVAL %s
             """, (symbol, f"{window_minutes} minutes"))
             row = cur.fetchone()
         conn.close()
@@ -130,9 +188,12 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
     hist = _ensure_history(sym)
 
     # ── 1. Sample latest tick into rolling window ─────────────────────────────
-    price, tfi, spread_ticks = _fetch_latest_tick(sym)
+    price, tfi, spread_ticks, obi = _fetch_latest_tick(sym)
     if price > 0.0:
-        hist.append((price, tfi, spread_ticks))
+        hist.append((price, tfi, spread_ticks, obi))
+
+    # ── 1b. Fetch live engine context (situational awareness for Agent Q) ─────
+    eng_ctx = _fetch_live_engine_context(sym)
 
     # ── 2. Compute institutional metrics ─────────────────────────────────────
     vol_bps               = 0.0
@@ -140,18 +201,21 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
     drift_bps             = 0.0
     native_spread         = 5.0
     adverse_selection_pct = 0.0
+    obi_mean              = 0.0
 
     try:
         if len(hist) >= 2:
-            prices  = np.array([p for p, _, _ in hist], dtype=float)
-            tfis    = np.array([t for _, t, _ in hist], dtype=float)
-            spreads = np.array([s for _, _, s in hist], dtype=float)
+            prices  = np.array([p for p, _, _, _ in hist], dtype=float)
+            tfis    = np.array([t for _, t, _, _ in hist], dtype=float)
+            spreads = np.array([s for _, _, s, _ in hist], dtype=float)
+            obis    = np.array([o for _, _, _, o in hist], dtype=float)
 
             returns    = np.diff(prices) / (prices[:-1] + 1e-12)
             vol_bps    = float(np.std(returns) * 10_000)
             tfi_zscore = float((tfis[-1] - np.mean(tfis)) / (np.std(tfis) + 1e-9))
             drift_bps  = float(((prices[-1] - prices[0]) / (prices[0] + 1e-12)) * 10_000)
             native_spread = float(np.mean(spreads))
+            obi_mean   = float(np.mean(obis))
 
         adverse_selection_pct = _fetch_adverse_selection(sym, window_minutes)
 
@@ -171,19 +235,28 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
     # ── 4. Publish structured JSON to Redis for dashboard ────────────────────
     try:
         structured = {
-            "symbol":            sym,
-            "ts":                int(time.time() * 1000),
-            "vol_bps":           round(vol_bps, 4),
-            "vol_label":         vol_label,
-            "tfi_zscore":        round(tfi_zscore, 4),
-            "tfi_label":         tox_label,
-            "drift_bps":         round(drift_bps, 4),
-            "drift_label":       trend_label,
-            "native_spread":     round(native_spread, 2),
-            "adverse_pct":       round(adverse_selection_pct, 2),
-            "adverse_label":     adv_label,
-            "window_minutes":    window_minutes,
-            "sample_count":      len(hist),
+            "symbol":                sym,
+            "ts":                    int(time.time() * 1000),
+            "vol_bps":               round(vol_bps, 4),
+            "vol_label":             vol_label,
+            "tfi_zscore":            round(tfi_zscore, 4),
+            "tfi_label":             tox_label,
+            "drift_bps":             round(drift_bps, 4),
+            "drift_label":           trend_label,
+            "native_spread":         round(native_spread, 2),
+            "obi_mean":              round(obi_mean, 4),
+            "obi_live":              round(eng_ctx["obi_live"], 4),
+            "adverse_pct":           round(adverse_selection_pct, 2),
+            "adverse_label":         adv_label,
+            "window_minutes":        window_minutes,
+            "sample_count":          len(hist),
+            # Live engine context
+            "inventory_coin":        round(eng_ctx["inventory_coin"], 6),
+            "pnl_mtm":               round(eng_ctx["pnl_mtm"], 4),
+            "decision":              eng_ctx["decision"],
+            "active_tranches":       eng_ctx["active_tranches"],
+            "applied_max_tranches":  eng_ctx["applied_max_tranches"],
+            "applied_grid_offset":   eng_ctx["applied_grid_offset"],
         }
         r = _get_redis()
         r.set(
@@ -194,14 +267,25 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
     except Exception as e:
         log.warning("[%s] State vector Redis publish failed: %s", sym, e)
 
-    # ── 5. Compressed string for LLM (~50 tokens) ────────────────────────────
+    # ── 5. Compressed string for LLM — includes OBI + engine context ─────────
+    # Engine context line gives Agent Q situational awareness:
+    # Is the engine loaded? Running at what tranche depth? MTM profitable?
+    eng_line = (
+        f"inv={eng_ctx['inventory_coin']:+.4f} coin | "
+        f"pnl_mtm={eng_ctx['pnl_mtm']:+.4f} USD | "
+        f"decision={eng_ctx['decision']} | "
+        f"tranches={eng_ctx['active_tranches']}/{eng_ctx['applied_max_tranches']} | "
+        f"offset={eng_ctx['applied_grid_offset']:.1f}t"
+    )
     return (
         f"[ORACLE 5M STATE VECTOR - {sym}]\n"
         f"1. Micro-Volatility: {vol_bps:.2f} bps/sec ({vol_label})\n"
         f"2. Order Flow Toxicity: {tfi_zscore:+.2f}\u03c3 ({tox_label})\n"
         f"3. Market Drift: {drift_bps:+.2f} bps/5m ({trend_label})\n"
         f"4. Native LOB Spread: {native_spread:.1f} ticks\n"
-        f"5. Adverse Selection: {adverse_selection_pct:.1f}% ({adv_label})"
+        f"5. Adverse Selection: {adverse_selection_pct:.1f}% ({adv_label})\n"
+        f"6. OBI (5m mean): {obi_mean:+.4f} (live: {eng_ctx['obi_live']:+.4f})\n"
+        f"7. Engine State: {eng_line}"
     )
 
 
@@ -210,19 +294,21 @@ def get_state_vector_structured(symbol: str, window_minutes: int = 5) -> dict:
     sym  = symbol.upper()
     hist = _ensure_history(sym)
 
-    vol_bps = tfi_zscore = drift_bps = native_spread = adverse_selection_pct = 0.0
+    vol_bps = tfi_zscore = drift_bps = native_spread = adverse_selection_pct = obi_mean = 0.0
 
     try:
         if len(hist) >= 2:
-            prices  = np.array([p for p, _, _ in hist], dtype=float)
-            tfis    = np.array([t for _, t, _ in hist], dtype=float)
-            spreads = np.array([s for _, _, s in hist], dtype=float)
+            prices  = np.array([p for p, _, _, _ in hist], dtype=float)
+            tfis    = np.array([t for _, t, _, _ in hist], dtype=float)
+            spreads = np.array([s for _, _, s, _ in hist], dtype=float)
+            obis    = np.array([o for _, _, _, o in hist], dtype=float)
 
             returns    = np.diff(prices) / (prices[:-1] + 1e-12)
             vol_bps    = float(np.std(returns) * 10_000)
             tfi_zscore = float((tfis[-1] - np.mean(tfis)) / (np.std(tfis) + 1e-9))
             drift_bps  = float(((prices[-1] - prices[0]) / (prices[0] + 1e-12)) * 10_000)
             native_spread = float(np.mean(spreads))
+            obi_mean   = float(np.mean(obis))
 
         adverse_selection_pct = _fetch_adverse_selection(sym, window_minutes)
     except Exception:
@@ -234,6 +320,7 @@ def get_state_vector_structured(symbol: str, window_minutes: int = 5) -> dict:
         "drift_bps":     drift_bps,
         "native_spread": native_spread,
         "adverse_pct":   adverse_selection_pct,
+        "obi_mean":      obi_mean,
     }
 
 

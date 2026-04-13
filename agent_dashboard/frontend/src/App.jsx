@@ -470,6 +470,18 @@ function AgentQPanel({ agentQ, rewardHistory, cadence }) {
               label2={sv.adverse_label?.includes('DANGER') ? 'DANGER' : 'SAFE'}
               color={sv.adverse_pct > 60 ? C.red : sv.adverse_pct > 40 ? C.amber : C.green}
             />
+            <SvRow
+              label="6. OBI 5m Mean / Live"
+              value={`${ppm(sv.obi_mean, 4)} / ${ppm(sv.obi_live, 4)}`}
+              label2={sv.obi_live > 0.3 ? 'BID-HEAVY' : sv.obi_live < -0.3 ? 'ASK-HEAVY' : 'BALANCED'}
+              color={sv.obi_live > 0.3 ? C.green : sv.obi_live < -0.3 ? C.red : C.muted}
+            />
+            <SvRow
+              label="7. Engine State"
+              value={`${sv.active_tranches ?? 0}/${sv.applied_max_tranches ?? 1} tranches · ${sv.decision ?? '—'}`}
+              label2={sv.pnl_mtm != null ? (sv.pnl_mtm >= 0 ? 'MTM+' : 'MTM−') : null}
+              color={sv.pnl_mtm >= 0 ? C.green : C.red}
+            />
           </div>
         ) : (
           <div className="text-xs" style={{ color: C.muted }}>

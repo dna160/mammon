@@ -17,11 +17,12 @@ Three loops run concurrently on daemon threads:
     classify macro regime → hft:regime:{symbol}
     Rust engine adopts structural quoting playbook instantly.
 
-  Tactical Loop (every 1 min) — parameter_tuner.py
+  Tactical Loop (every 3 min) — parameter_tuner.py  [V2.2 cadence]
     Reads active regime from Redis.
     Adversarial Alpha/CRO pipeline with Dynamic Bounding Matrix + RAG memory.
-    Publishes tuned params (gamma, spread, tfi, obi_threshold) → hft:live_params:{symbol}.
-    Logs decision to agent_q_memory for 1-min reward back-fill.
+    Publishes tuned params (gamma, spread, tfi, obi_threshold, max_active_tranches,
+    grid_offset_ticks) → hft:live_params:{symbol}.
+    Logs decision to agent_q_memory for 3-min reward back-fill.
 
 Dead-Man's Switch: any unhandled exception in Oracle or Tactical triggers
 SAFE_MODE_LOCKDOWN on all affected symbols.
