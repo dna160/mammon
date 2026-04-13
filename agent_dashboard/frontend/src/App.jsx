@@ -113,11 +113,15 @@ function Badge({ label, color, size = 'sm' }) {
   );
 }
 
-function PingPongBadge({ state }) {
-  // state: 0 = Empty/Bidding, 1 = Loaded/Asking, null = unknown
-  if (state === 0)  return <Badge label="STATE 0 · BIDDING" color={C.blue}  size="xs" />;
-  if (state === 1)  return <Badge label="STATE 1 · LOADED"  color={C.amber} size="xs" />;
-  return <Badge label="WARMING UP" color={C.muted} size="xs" />;
+function TrancheBadge({ activeTranches, maxTranches }) {
+  // Multi-tranche grid state indicator
+  // activeTranches: how many $6 lots are currently held
+  // maxTranches: the Agent Q ceiling (1 = strict ping-pong)
+  const max = maxTranches ?? 1;
+  const act = activeTranches ?? 0;
+  if (act === 0)       return <Badge label={`0/${max} · BIDDING`}  color={C.blue}  size="xs" />;
+  if (act >= max)      return <Badge label={`${act}/${max} · FULL`} color={C.red}   size="xs" />;
+  return                      <Badge label={`${act}/${max} · SCALING`} color={C.green} size="xs" />;
 }
 
 function Stat({ label, value, color }) {
@@ -155,15 +159,13 @@ function SymbolStrip({ symbol, holding, order, agentQ }) {
   const isLive  = status === 'LIVE';
   const isSafe  = status === 'SAFE_MODE_LOCKDOWN';
 
-  const price   = holding?.micro_price ?? 0;
-  const inv     = holding?.inventory_coin ?? 0;
-  const pnl     = order?.real_pnl_usd ?? 0;
-  const pp_st   = order?.ping_pong ?? null;
-
-  // Determine ping-pong state from order data
-  const ppState = order
-    ? (order.bid_id && !order.ask_id ? 0 : order.ask_id && !order.bid_id ? 1 : null)
-    : null;
+  const price          = holding?.micro_price ?? 0;
+  const inv            = holding?.inventory_coin ?? 0;
+  const pnl            = order?.real_pnl_usd ?? 0;
+  // Multi-tranche: compute active tranches from live inventory notional
+  const currentNotional  = inv * price;
+  const activeTranches   = Math.floor(currentNotional / 6.0);
+  const maxTranches      = params?.max_active_tranches ?? 1;
 
   return (
     <div
@@ -212,12 +214,12 @@ function SymbolStrip({ symbol, holding, order, agentQ }) {
       <div className="flex items-center gap-1">
         <Badge label={regMeta.label} color={regMeta.color} size="xs" />
         {params && <span className="text-[10px]" style={{ color: C.muted }}>
-          γ={pp(params.gamma, 2)} s={pp(params.min_spread_ticks, 1)}
+          γ={pp(params.gamma, 2)} s={pp(params.min_spread_ticks, 1)} obi={pp(params.obi_threshold, 2)}
         </span>}
       </div>
 
-      {/* Ping-pong state */}
-      <PingPongBadge state={ppState} />
+      {/* Multi-tranche state */}
+      <TrancheBadge activeTranches={activeTranches} maxTranches={maxTranches} />
 
       {/* System status */}
       <div className="ml-auto">
@@ -314,9 +316,12 @@ function AgentQPanel({ agentQ, rewardHistory }) {
         {/* Live params */}
         {params ? (
           <div className="grid grid-cols-3 gap-3">
-            <Stat label="γ (Gamma)"    value={pp(params.gamma, 3)}            color={C.blue} />
-            <Stat label="Min Spread"   value={`${pp(params.min_spread_ticks, 1)} tks`} color={C.amber} />
-            <Stat label="TFI Threshold" value={`$${parseFloat(params.tfi_threshold ?? 0).toLocaleString()}`} color={C.purple} />
+            <Stat label="γ (Gamma)"      value={pp(params.gamma, 3)}            color={C.blue} />
+            <Stat label="Min Spread"     value={`${pp(params.min_spread_ticks, 1)} tks`} color={C.amber} />
+            <Stat label="TFI Threshold"  value={`$${parseFloat(params.tfi_threshold ?? 0).toLocaleString()}`} color={C.purple} />
+            <Stat label="OBI Shield"     value={pp(params.obi_threshold, 2)}    color={parseFloat(params.obi_threshold ?? 1) >= 0.7 ? C.green : parseFloat(params.obi_threshold ?? 1) <= 0.3 ? C.red : C.amber} />
+            <Stat label="Max Tranches"   value={`${params.max_active_tranches ?? 1} / 10`} color={C.teal} />
+            <Stat label="Capital Depth"  value={`$${((params.max_active_tranches ?? 1) * 6).toFixed(0)}`} color={C.muted} />
           </div>
         ) : (
           <div className="text-xs" style={{ color: C.muted }}>No params published yet.</div>
@@ -342,9 +347,9 @@ function AgentQPanel({ agentQ, rewardHistory }) {
               <div className="flex flex-col gap-0.5">
                 <span className="text-[10px]" style={{ color: C.muted }}>ROUND TRIPS</span>
                 <span className="text-sm font-mono font-bold"
-                  style={{ color: (lastEvaluated.total_round_trips ?? 0) >= 100 ? C.green : C.red }}>
+                  style={{ color: (lastEvaluated.total_round_trips ?? 0) >= 15 ? C.green : C.red }}>
                   {lastEvaluated.total_round_trips ?? 0}
-                  <span className="text-[10px] font-normal" style={{ color: C.muted }}>/100</span>
+                  <span className="text-[10px] font-normal" style={{ color: C.muted }}>/15</span>
                 </span>
               </div>
               <div className="flex flex-col gap-0.5">
@@ -364,7 +369,7 @@ function AgentQPanel({ agentQ, rewardHistory }) {
             </div>
           ) : (
             <div className="text-xs" style={{ color: C.muted }}>
-              No evaluated cycles yet — first reward computed at T+15min.
+              No evaluated cycles yet — first reward computed at T+1min.
             </div>
           )}
           {params?.cro_reasoning && (
@@ -563,25 +568,29 @@ function HoldingsPanel({ holdings }) {
 
 // ── Order Queue Panel ─────────────────────────────────────────────────────────
 
-function OrderQueuePanel({ orders, holdings }) {
+function OrderQueuePanel({ orders, holdings, agentQ }) {
   const rows = Object.entries(COIN_META).map(([sym, meta]) => {
-    // Orders are now derived from holdings pipeline data (open_bid/open_ask)
-    const h = holdings?.[sym];
-    const openBid = h?.open_bid   ?? null;
-    const openAsk = h?.open_ask   ?? null;
-    const optBid  = h?.optimal_bid ?? null;
-    const optAsk  = h?.optimal_ask ?? null;
-    const hasBid  = openBid !== null;
-    const hasAsk  = openAsk !== null;
-    const ppState = h?.ping_pong ?? null;
-    const decision = h?.decision ?? '—';
-    return { sym, meta, h, openBid, openAsk, optBid, optAsk, hasBid, hasAsk, ppState, decision };
+    const h           = holdings?.[sym];
+    const params      = agentQ?.[sym]?.params;
+    const openBid     = h?.open_bid    ?? null;
+    const openAsk     = h?.open_ask    ?? null;
+    const optBid      = h?.optimal_bid ?? null;
+    const optAsk      = h?.optimal_ask ?? null;
+    const hasBid      = openBid !== null;
+    const hasAsk      = openAsk !== null;
+    const decision    = h?.decision ?? '—';
+    const maxTranches = params?.max_active_tranches ?? 1;
+    const inv         = h?.inventory_coin ?? 0;
+    const price       = h?.micro_price ?? 0;
+    const notional    = inv * price;
+    const activeTranches = Math.floor(notional / 6.0);
+    return { sym, meta, h, openBid, openAsk, optBid, optAsk, hasBid, hasAsk, decision, maxTranches, activeTranches, notional };
   });
 
   return (
     <Panel title="Order Queue — Active Bids / Asks">
       <div className="overflow-y-auto" style={{ maxHeight: 300 }}>
-        {rows.map(({ sym, meta, h, openBid, openAsk, optBid, optAsk, hasBid, hasAsk, ppState, decision }) => (
+        {rows.map(({ sym, meta, h, openBid, openAsk, optBid, optAsk, hasBid, hasAsk, decision, maxTranches, activeTranches, notional }) => (
           <div
             key={sym}
             className="px-4 py-3 border-b"
@@ -590,11 +599,32 @@ function OrderQueuePanel({ orders, holdings }) {
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
                 <span className="text-xs font-bold" style={{ color: meta.color }}>{meta.coin}</span>
-                <PingPongBadge state={ppState} />
+                <TrancheBadge activeTranches={activeTranches} maxTranches={maxTranches} />
               </div>
               <span className="text-[10px] font-mono" style={{ color: C.muted }}>
                 {h?.total_trades ? `${h.total_trades} fills` : '0 fills'}
               </span>
+            </div>
+
+            {/* Tranche depth bar */}
+            <div className="mb-2">
+              <div className="flex items-center justify-between mb-0.5">
+                <span className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>
+                  Grid Depth — ${notional.toFixed(2)} / ${(maxTranches * 6).toFixed(0)}
+                </span>
+                <span className="text-[9px] font-mono" style={{ color: C.teal }}>
+                  {activeTranches}/{maxTranches} tranches
+                </span>
+              </div>
+              <div className="h-1 rounded-full overflow-hidden" style={{ background: C.surface2 }}>
+                <div
+                  className="h-full rounded-full transition-all duration-500"
+                  style={{
+                    width: `${Math.min((activeTranches / Math.max(maxTranches, 1)) * 100, 100)}%`,
+                    background: activeTranches >= maxTranches ? C.red : activeTranches > 0 ? C.green : C.border,
+                  }}
+                />
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -731,8 +761,10 @@ function KpiBar({ kpis }) {
             color={(k.avg_pnl_per_trade ?? 0) >= 0 ? C.green : C.red} />
       <Stat label="Win Rate (24h)"    value={`${pp(k.win_rate_pct, 1)}%`}
             color={(k.win_rate_pct ?? 0) >= 50 ? C.green : C.red} />
-      <Stat label="Daily ROE"         value={`${ppm(k.daily_roe, 4)}%`}
-            color={(k.daily_roe ?? 0) >= 0 ? C.green : C.red} />
+      <Stat label="Round Trips (24h)" value={`${k.round_trips ?? 0}`}
+            color={C.teal} />
+      <Stat label="RL Cadence Target" value="15 / min"
+            color={C.muted} />
     </div>
   );
 }
@@ -832,7 +864,7 @@ function TradeLog({ trades }) {
 // ── Reward History ────────────────────────────────────────────────────────────
 
 function RewardHistory({ data }) {
-  const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'TFI', 'Trips', 'Win%', 'Net PnL', 'AQ%', 'Score', 'Override'];
+  const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'TFI', 'Trips /15', 'Win%', 'Net PnL', 'AQ%', 'Score', 'Override'];
 
   return (
     <Panel title="Agent Q Memory — RAG Reward Scorecard">
@@ -852,7 +884,7 @@ function RewardHistory({ data }) {
             {!data?.length ? (
               <tr>
                 <td colSpan={RH.length} className="px-3 py-10 text-center text-sm" style={{ color: C.muted }}>
-                  No agent_q_memory entries yet. First tactical cycle runs in 15 min…
+                  No agent_q_memory entries yet. First reward evaluated at T+1min…
                 </td>
               </tr>
             ) : (
@@ -883,7 +915,7 @@ function RewardHistory({ data }) {
                       {parseFloat(r.tfi_threshold ?? 0).toLocaleString()}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
-                      style={{ color: pending ? C.muted : (r.total_round_trips ?? 0) >= 100 ? C.green : C.red }}>
+                      style={{ color: pending ? C.muted : (r.total_round_trips ?? 0) >= 15 ? C.green : C.red }}>
                       {pending ? '—' : (r.total_round_trips ?? 0)}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
@@ -1012,7 +1044,7 @@ export default function App() {
             <Badge label="SELF-HEALING AGENTIC HFT" color={C.amber} size="xs" />
           </div>
           <p className="text-[10px] mt-0.5" style={{ color: C.muted }}>
-            Avellaneda-Stoikov · Ping-Pong State Machine · RAG Memory · Agent Q
+            Avellaneda-Stoikov · Multi-Tranche Grid ($6/tranche, up to 10) · RAG Memory · Agent Q
           </p>
         </div>
 
@@ -1078,7 +1110,7 @@ export default function App() {
 
         {/* Order Queue — col 3 */}
         <div style={{ gridColumn: '3', gridRow: '1' }}>
-          <OrderQueuePanel orders={d.orders} holdings={d.holdings} />
+          <OrderQueuePanel orders={d.orders} holdings={d.holdings} agentQ={d.agent_q} />
         </div>
 
         {/* PnL Chart — col 2-3 */}
