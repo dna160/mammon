@@ -847,27 +847,34 @@ function PnlChart({ chart }) {
 
 // ── KPI Bar ───────────────────────────────────────────────────────────────────
 
-function KpiBar({ kpis, holdings, cadence, equityPnl, equityNow, startingFdusd, fdusdBalance }) {
+function KpiBar({ kpis, holdings, cadence, equityPnl, equityNow, startingFdusd, fdusdBalance, resetTs }) {
   const k = kpis ?? {};
 
-  // Total live trips across all coins in the current 3-min window
   const totalTrips3min  = Object.values(cadence ?? {}).reduce((s, c) => s + (c?.trips_3min ?? 0), 0);
   const totalTarget3min = Object.keys(cadence ?? {}).length * 15;
 
-  // Equity PnL is the primary metric: current_equity − starting_FDUSD
-  const hasEquity    = equityPnl != null;
-  const equityColor  = !hasEquity ? C.muted : equityPnl >= 0 ? C.green : C.red;
+  const hasEquity   = equityPnl != null;
+  const equityColor = !hasEquity ? C.muted : equityPnl >= 0 ? C.green : C.red;
+
+  const sessionLabel = resetTs
+    ? `Session PnL (from ${new Date(resetTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`
+    : 'Session PnL';
 
   return (
     <div
       className="flex flex-wrap gap-6 px-6 py-3 border-b"
       style={{ background: C.surface2, borderColor: C.border }}
     >
-      {/* Primary: FDUSD equity PnL — the real money number */}
+      {/* ── Primary: FDUSD equity PnL ── */}
       <Stat
-        label={startingFdusd != null ? `PnL vs Start ($${parseFloat(startingFdusd).toFixed(2)} FDUSD)` : 'Session PnL'}
-        value={hasEquity ? `${ppm(equityPnl, 4)} USD` : '— (reset to start)'}
+        label={sessionLabel}
+        value={hasEquity ? `${ppm(equityPnl, 4)} USD` : '— press Reset to start'}
         color={equityColor}
+      />
+      <Stat
+        label="Starting FDUSD"
+        value={startingFdusd != null ? `$${parseFloat(startingFdusd).toFixed(2)}` : '—'}
+        color={C.muted}
       />
       <Stat
         label="FDUSD Balance"
@@ -875,17 +882,18 @@ function KpiBar({ kpis, holdings, cadence, equityPnl, equityNow, startingFdusd, 
         color={C.teal}
       />
       <Stat
-        label="Total Equity Now"
+        label="Total Equity"
         value={equityNow != null ? `$${parseFloat(equityNow).toFixed(2)}` : '—'}
         color={C.blue}
       />
-      <Stat label="Trades (24h)"      value={k.daily_trades ?? '—'} />
-      <Stat label="Realised PnL (24h)"
+      <div style={{ width: 1, background: C.border, margin: '0 4px' }} />
+      <Stat label="Trades" value={k.daily_trades ?? '—'} />
+      <Stat label="Session PnL (realised)"
             value={`${ppm(k.total_net_pnl, 4)} USD`}
             color={(k.total_net_pnl ?? 0) >= 0 ? C.green : C.red} />
-      <Stat label="Win Rate (24h)"    value={`${pp(k.win_rate_pct, 1)}%`}
+      <Stat label="Win Rate"  value={`${pp(k.win_rate_pct, 1)}%`}
             color={(k.win_rate_pct ?? 0) >= 50 ? C.green : C.red} />
-      <Stat label="Live Trips / 3min (all)"
+      <Stat label="Trips / 3min"
             value={`${totalTrips3min} / ${totalTarget3min}`}
             color={totalTrips3min >= totalTarget3min ? C.green : totalTrips3min >= totalTarget3min * 0.5 ? C.amber : C.red} />
     </div>
@@ -1259,6 +1267,7 @@ export default function App() {
         equityNow={d.equity_now}
         startingFdusd={d.starting_fdusd}
         fdusdBalance={d.fdusd_balance}
+        resetTs={d.reset_ts}
       />
 
       {/* ── Symbol Strips ── */}

@@ -64,6 +64,18 @@ function broadcast(data) {
   });
 }
 
+// ── Session reset timestamp ───────────────────────────────────────────────────
+// All DB queries gate on timestamp >= reset_ts so the dashboard only shows data
+// from the current session. Redis key: dashboard:reset_ts (ISO string).
+// Returns epoch-ms number, or 0 (epoch) if no reset has been done yet.
+async function getResetTs() {
+  try {
+    const raw = await redis.get('dashboard:reset_ts');
+    if (!raw) return 0;
+    return parseInt(raw, 10) || 0;
+  } catch (_) { return 0; }
+}
+
 // ── Data collectors ───────────────────────────────────────────────────────────
 
 async function getHoldings() {
@@ -233,7 +245,9 @@ async function getAgentQ() {
 
 async function getKpis() {
   try {
-    const result = await pool.query(`
+    const resetTs = await getResetTs();
+    const since   = new Date(resetTs).toISOString();
+    const result  = await pool.query(`
       SELECT
         COUNT(*)::int                                   AS daily_trades,
         COALESCE(SUM(net_pnl_usd), 0)                 AS total_net_pnl,
@@ -243,11 +257,10 @@ async function getKpis() {
           / NULLIF(COUNT(*), 0),
           0
         )                                               AS win_rate_pct,
-        -- Round trips = completed sell fills (each sell closes a buy position)
         COUNT(*) FILTER (WHERE side = 'SELL')::int      AS round_trips
       FROM execution_log
-      WHERE timestamp > NOW() - INTERVAL '24 hours'
-    `);
+      WHERE timestamp >= $1
+    `, [since]);
     const r = result.rows[0] || {};
     return {
       daily_trades:      r.daily_trades      || 0,
@@ -265,7 +278,9 @@ async function getKpis() {
 
 async function getTrades(limit = 100) {
   try {
-    const result = await pool.query(`
+    const resetTs = await getResetTs();
+    const since   = new Date(resetTs).toISOString();
+    const result  = await pool.query(`
       SELECT
         id::text            AS trade_id,
         timestamp,
@@ -281,9 +296,10 @@ async function getTrades(limit = 100) {
         order_id,
         trade_id            AS exchange_trade_id
       FROM execution_log
+      WHERE timestamp >= $1
       ORDER BY timestamp DESC
-      LIMIT $1
-    `, [limit]);
+      LIMIT $2
+    `, [since, limit]);
     return result.rows;
   } catch (e) {
     console.error('[Trades] query error:', e.message);
@@ -293,7 +309,9 @@ async function getTrades(limit = 100) {
 
 async function getChart() {
   try {
-    const result = await pool.query(`
+    const resetTs = await getResetTs();
+    const since   = new Date(resetTs).toISOString();
+    const result  = await pool.query(`
       SELECT
         date_trunc('minute', timestamp)      AS bucket,
         COALESCE(SUM(net_pnl_usd), 0)       AS period_pnl,
@@ -302,10 +320,10 @@ async function getChart() {
           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         )                                    AS cumulative_pnl
       FROM execution_log
-      WHERE timestamp > NOW() - INTERVAL '24 hours'
+      WHERE timestamp >= $1
       GROUP BY bucket
       ORDER BY bucket ASC
-    `);
+    `, [since]);
     return result.rows.map((r) => ({
       time:           r.bucket.toISOString(),
       period_pnl:     parseFloat(r.period_pnl)     || 0,
@@ -320,7 +338,9 @@ async function getChart() {
 // Per-symbol round-trips in the last 3-minute RL window (cadence tracking)
 async function getLiveCadence() {
   try {
-    const result = await pool.query(`
+    const resetTs   = await getResetTs();
+    const since3min = new Date(Math.max(resetTs, Date.now() - 3 * 60 * 1000)).toISOString();
+    const result    = await pool.query(`
       SELECT
         symbol,
         COUNT(*) FILTER (WHERE side = 'SELL')::int   AS trips_3min,
@@ -332,9 +352,9 @@ async function getLiveCadence() {
           0
         )                                              AS wr_3min
       FROM execution_log
-      WHERE timestamp > NOW() - INTERVAL '3 minutes'
+      WHERE timestamp >= $1
       GROUP BY symbol
-    `);
+    `, [since3min]);
     const cadence = {};
     SYMBOLS.forEach((s) => { cadence[s] = { trips_3min: 0, fills_3min: 0, pnl_3min: 0, wr_3min: 0 }; });
     result.rows.forEach((r) => {
@@ -356,9 +376,8 @@ async function getLiveCadence() {
 
 async function getRewardHistory(limit = 50) {
   try {
-    // Only return evaluated rows (evaluated_at IS NOT NULL) so the scorecard
-    // never shows PENDING placeholders. A separate pending_count is returned
-    // for the UI badge.
+    const resetTs = await getResetTs();
+    const since   = new Date(resetTs).toISOString();
     const [evaluated, pending] = await Promise.all([
       pool.query(`
         SELECT
@@ -373,10 +392,14 @@ async function getRewardHistory(limit = 50) {
           alpha_reasoning, cro_reasoning, override_applied
         FROM agent_q_memory
         WHERE evaluated_at IS NOT NULL
+          AND timestamp >= $1
         ORDER BY evaluated_at DESC
-        LIMIT $1
-      `, [limit]),
-      pool.query(`SELECT COUNT(*)::int AS n FROM agent_q_memory WHERE evaluated_at IS NULL`),
+        LIMIT $2
+      `, [since, limit]),
+      pool.query(`
+        SELECT COUNT(*)::int AS n FROM agent_q_memory
+        WHERE evaluated_at IS NULL AND timestamp >= $1
+      `, [since]),
     ]);
     return {
       rows:          evaluated.rows,
@@ -389,7 +412,7 @@ async function getRewardHistory(limit = 50) {
 }
 
 async function getFullSnapshot() {
-  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory, cadence, fdusdBal] = await Promise.all([
+  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory, cadence, fdusdBal, resetTs] = await Promise.all([
     getHoldings(),
     getOrders(),
     getLastFills(),
@@ -400,6 +423,7 @@ async function getFullSnapshot() {
     getRewardHistory(50),
     getLiveCadence(),
     getFdusdBalances(),
+    getResetTs(),
   ]);
 
   // ── Equity PnL (FDUSD-based — the real number) ───────────────────────────────
@@ -447,6 +471,7 @@ async function getFullSnapshot() {
     equity_baseline:       equityBaseline,
     starting_fdusd:        startingFdusd,
     equity_pnl:            equityPnl,
+    reset_ts:              resetTs || null,
   };
 }
 
@@ -554,46 +579,57 @@ async function getTotalEquity(holdings, fdusdBalances) {
   return equity;
 }
 
-// POST /api/reset-pnl  — snapshot current FDUSD equity as the zero-point baseline.
-// All fields are zeroed visually; PnL = equity_now − equity_at_reset.
+// POST /api/reset-pnl  — full dashboard session reset.
+//
+// Zeroes EVERYTHING visible in the dashboard:
+//   • Trade log        — timestamp gate: only shows fills after reset
+//   • PnL chart        — timestamp gate: chart starts at 0 from reset
+//   • KPI stats        — timestamp gate: all counts/PnL from reset onwards
+//   • Reward history   — timestamp gate: only Agent Q cycles after reset
+//   • Live cadence     — timestamp gate: 3-min window starts after reset
+//   • Per-coin PnL     — MTM baseline zeroed for each symbol
+//   • Last fills panel — Redis keys cleared
+//
+// The FDUSD balance is snapshotted as the equity baseline.
+// PnL = (FDUSD_now + coin_notional_now) − equity_at_reset.
 app.post('/api/reset-pnl', async (req, res) => {
   try {
+    const ts = Date.now();
     const [h, fdusdBal] = await Promise.all([getHoldings(), getFdusdBalances()]);
 
-    const equity = await getTotalEquity(h, fdusdBal);
-    if (equity === null) {
-      // Fallback: if engine_d:balances not yet populated, use old MTM method
-      const targets = SYMBOLS;
-      await Promise.all(targets.map(async (sym) => {
-        const hd = h[sym];
-        if (!hd) return;
-        const baseline = hd.pnl_mtm + (hd.pnl_baseline ?? 0);
-        await redis.set(`dashboard:pnl_baseline:${sym}`, baseline.toFixed(8));
-      }));
-      console.log('[PnL Reset] Fallback MTM reset (engine_d:balances not available)');
-      return res.json({ ok: true, method: 'mtm_fallback' });
-    }
+    // ── 1. Session timestamp — gates all DB queries after this moment ──────────
+    await redis.set('dashboard:reset_ts', String(ts));
 
-    // Store the equity snapshot as the global starting point.
-    const ts = Date.now();
+    // ── 2. Equity baseline — PnL = equity_now − this ──────────────────────────
+    const equity = await getTotalEquity(h, fdusdBal);
     await redis.set('dashboard:equity_baseline', JSON.stringify({
-      equity:  equity.toFixed(8),
-      fdusd:   (fdusdBal?.fdusd ?? 0).toFixed(4),
+      equity: equity != null ? equity.toFixed(8) : '0',
+      fdusd:  (fdusdBal?.fdusd ?? 0).toFixed(4),
       ts,
     }));
 
-    // Also zero per-symbol MTM baselines so coin strips show 0.
+    // ── 3. Zero per-symbol MTM baselines so coin strips show 0 ────────────────
     await Promise.all(SYMBOLS.map(async (sym) => {
       const hd = h[sym];
       if (!hd) return;
-      const mtm = hd.pnl_mtm + (hd.pnl_baseline ?? 0);
-      await redis.set(`dashboard:pnl_baseline:${sym}`, mtm.toFixed(8));
+      const currentMtm = (hd.pnl_mtm ?? 0) + (hd.pnl_baseline ?? 0);
+      await redis.set(`dashboard:pnl_baseline:${sym}`, currentMtm.toFixed(8));
     }));
 
-    console.log(`[PnL Reset] Equity baseline = $${equity.toFixed(4)} FDUSD (at ${new Date(ts).toISOString()})`);
-    res.json({ ok: true, starting_equity: equity, fdusd: fdusdBal?.fdusd, ts });
+    // ── 4. Clear last-fill Redis keys so the fills panel empties ──────────────
+    await Promise.all(SYMBOLS.map((sym) =>
+      redis.del(`engine_d:${sym}:last_fill`).catch(() => {})
+    ));
+
+    const fdusd = fdusdBal?.fdusd ?? null;
+    console.log(
+      `[Full Reset] ${new Date(ts).toISOString()} | ` +
+      `FDUSD=${fdusd != null ? '$' + fdusd.toFixed(2) : 'unknown'} | ` +
+      `equity=${equity != null ? '$' + equity.toFixed(4) : 'unknown'}`
+    );
+    res.json({ ok: true, reset_ts: ts, starting_fdusd: fdusd, starting_equity: equity });
   } catch (e) {
-    console.error('[PnL Reset] error:', e.message);
+    console.error('[Full Reset] error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
