@@ -161,7 +161,8 @@ function SymbolStrip({ symbol, holding, order, agentQ }) {
 
   const price          = holding?.micro_price ?? 0;
   const inv            = holding?.inventory_coin ?? 0;
-  const pnl            = order?.real_pnl_usd ?? 0;
+  // Use MTM PnL (mark-to-market): cash-flow + open position value
+  const pnl            = holding?.pnl_mtm ?? 0;
   // Multi-tranche: compute active tranches from live inventory notional
   const currentNotional  = inv * price;
   const activeTranches   = Math.floor(currentNotional / 6.0);
@@ -202,11 +203,11 @@ function SymbolStrip({ symbol, holding, order, agentQ }) {
         </span>
       </div>
 
-      {/* Live PnL */}
-      <div className="flex flex-col w-24">
-        <span className="text-[10px]" style={{ color: C.muted }}>ENGINE PnL</span>
+      {/* Live MTM PnL */}
+      <div className="flex flex-col w-28">
+        <span className="text-[10px]" style={{ color: C.muted }}>MTM PnL</span>
         <span className="text-sm font-mono font-bold" style={{ color: pnl >= 0 ? C.green : C.red }}>
-          {ppm(pnl, 2)} USD
+          {ppm(pnl, 4)} USD
         </span>
       </div>
 
@@ -237,7 +238,7 @@ function SymbolStrip({ symbol, holding, order, agentQ }) {
 
 // ── Agent Q Panel ─────────────────────────────────────────────────────────────
 
-function AgentQPanel({ agentQ, rewardHistory }) {
+function AgentQPanel({ agentQ, rewardHistory, cadence }) {
   const [activeTab, setActiveTab] = useState(Object.keys(COIN_META)[0]);
 
   const data  = agentQ?.[activeTab];
@@ -245,6 +246,10 @@ function AgentQPanel({ agentQ, rewardHistory }) {
   const params = data?.params;
   const regime = data?.regime?.regime ?? 'UNKNOWN';
   const regMeta = REGIME_META[regime] ?? REGIME_META.UNKNOWN;
+
+  // Live 3-min cadence for the active tab
+  const liveCad = cadence?.[activeTab] ?? { trips_3min: 0, wr_3min: 0, pnl_3min: 0 };
+  const TRIP_TARGET = 15;
 
   const symHistory = useMemo(
     () => (rewardHistory ?? []).filter((r) => r.symbol === activeTab).slice(0, 8),
@@ -313,7 +318,7 @@ function AgentQPanel({ agentQ, rewardHistory }) {
           )}
         </div>
 
-        {/* Live params — 6 levers from Agent Q */}
+        {/* Live params — 6 AI levers from Agent Q */}
         {params ? (
           <div className="grid grid-cols-3 gap-3">
             <Stat label="γ (Gamma)"       value={pp(params.gamma, 3)}            color={C.blue} />
@@ -325,11 +330,56 @@ function AgentQPanel({ agentQ, rewardHistory }) {
             <Stat label="Grid Offset"     value={`${pp(params.grid_offset_ticks ?? 2.0, 1)} tks`}
               color={parseFloat(params.grid_offset_ticks ?? 2) >= 10 ? C.orange : parseFloat(params.grid_offset_ticks ?? 2) <= 2 ? C.green : C.amber} />
             <Stat label="Capital Depth"   value={`$${((params.max_active_tranches ?? 1) * 6).toFixed(0)}`} color={C.muted} />
-            <Stat label="Cycle Cadence"   value="3-min RL" color={C.muted} />
-            <Stat label="Trip Target"     value="15 / 3min" color={C.muted} />
+            {/* Live cadence — actual trips this 3-min window vs 15 target */}
+            <Stat
+              label="Live Trips / 3min"
+              value={`${liveCad.trips_3min} / ${TRIP_TARGET}`}
+              color={liveCad.trips_3min >= TRIP_TARGET ? C.green : liveCad.trips_3min >= 8 ? C.amber : C.red}
+            />
+            {/* Live WR this cycle */}
+            <Stat
+              label="Cycle Win Rate"
+              value={liveCad.trips_3min > 0 ? `${pp(liveCad.wr_3min, 1)}%` : '—'}
+              color={liveCad.wr_3min >= 50 ? C.green : liveCad.wr_3min > 0 ? C.amber : C.muted}
+            />
           </div>
         ) : (
           <div className="text-xs" style={{ color: C.muted }}>No params published yet. Agent Q warming up…</div>
+        )}
+
+        {/* 3-min cadence progress bar */}
+        {params && (
+          <div className="rounded p-2 border" style={{ background: C.surface2, borderColor: C.border }}>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] uppercase tracking-wider" style={{ color: C.muted }}>
+                3-Min Cadence — {liveCad.trips_3min} / {TRIP_TARGET} trips
+              </span>
+              <span className="text-[10px] font-mono" style={{
+                color: liveCad.trips_3min >= TRIP_TARGET ? C.green : liveCad.trips_3min >= 8 ? C.amber : C.red
+              }}>
+                {liveCad.trips_3min >= TRIP_TARGET ? '✓ ON TARGET' : liveCad.trips_3min >= 8 ? '~ CLOSE' : '✗ STARVING'}
+              </span>
+            </div>
+            <div className="h-1.5 rounded-full overflow-hidden" style={{ background: C.border }}>
+              <div
+                className="h-full rounded-full transition-all duration-700"
+                style={{
+                  width: `${Math.min((liveCad.trips_3min / TRIP_TARGET) * 100, 100)}%`,
+                  background: liveCad.trips_3min >= TRIP_TARGET ? C.green : liveCad.trips_3min >= 8 ? C.amber : C.red,
+                }}
+              />
+            </div>
+            {liveCad.trips_3min > 0 && (
+              <div className="flex items-center gap-3 mt-1.5">
+                <span className="text-[9px] font-mono" style={{ color: C.muted }}>
+                  WR {pp(liveCad.wr_3min, 1)}%
+                </span>
+                <span className="text-[9px] font-mono" style={{ color: liveCad.pnl_3min >= 0 ? C.green : C.red }}>
+                  PnL {ppm(liveCad.pnl_3min, 4)} USD
+                </span>
+              </div>
+            )}
+          </div>
         )}
 
         {/* T-1 RL Memory */}
@@ -338,7 +388,7 @@ function AgentQPanel({ agentQ, rewardHistory }) {
           style={{ background: C.surface2, borderColor: C.border }}
         >
           <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: C.muted }}>
-            T-1 RL Memory — Cadence Feedback
+            T-1 RL Memory — Last Evaluated 3-min Cycle
           </div>
           {lastEvaluated ? (
             <div className="flex flex-wrap gap-4">
@@ -374,7 +424,7 @@ function AgentQPanel({ agentQ, rewardHistory }) {
             </div>
           ) : (
             <div className="text-xs" style={{ color: C.muted }}>
-              No evaluated cycles yet — first reward computed at T+1min.
+              No evaluated cycles yet — first reward computed after T+3min.
             </div>
           )}
           {params?.cro_reasoning && (
@@ -470,7 +520,7 @@ function AgentQPanel({ agentQ, rewardHistory }) {
 
 // ── Holdings Panel ────────────────────────────────────────────────────────────
 
-function HoldingsPanel({ holdings }) {
+function HoldingsPanel({ holdings, onResetPnl }) {
   const rows = Object.entries(COIN_META).map(([sym, meta]) => {
     const h        = holdings?.[sym];
     // Use real_inventory (exchange-reconciled) when available, fall back to shadow ledger
@@ -480,15 +530,30 @@ function HoldingsPanel({ holdings }) {
     const isReal   = realInv !== null && realInv !== undefined;
     const price    = h?.micro_price ?? 0;
     const notional = inv * price;
-    return { sym, meta, h, inv, shadowInv, isReal, price, notional };
+    // MTM PnL = cash-flow PnL + open inventory value (baseline-adjusted)
+    const pnlDisplay = h?.pnl_mtm ?? 0;
+    return { sym, meta, h, inv, shadowInv, isReal, price, notional, pnlDisplay };
   });
 
   const totalNotional = rows.reduce((s, r) => s + Math.abs(r.notional), 0);
+  const totalMtmPnl   = rows.reduce((s, r) => s + (r.pnlDisplay ?? 0), 0);
 
   return (
-    <Panel title="Holdings — Live Inventory">
+    <Panel
+      title="Holdings — Live Inventory"
+      action={
+        <button
+          onClick={onResetPnl}
+          className="text-[10px] font-mono px-2 py-0.5 rounded transition-opacity hover:opacity-80"
+          style={{ background: `${C.amber}22`, color: C.amber, border: `1px solid ${C.amber}44` }}
+          title="Zero all PnL baselines (mark current MTM as break-even)"
+        >
+          Reset PnL
+        </button>
+      }
+    >
       <div className="overflow-y-auto" style={{ maxHeight: 300 }}>
-        {rows.map(({ sym, meta, h, inv, shadowInv, isReal, price, notional }) => (
+        {rows.map(({ sym, meta, h, inv, shadowInv, isReal, price, notional, pnlDisplay }) => (
           <div
             key={sym}
             className="flex items-center gap-3 px-4 py-3 border-b"
@@ -557,8 +622,8 @@ function HoldingsPanel({ holdings }) {
                       grid {h.grid_offset_ticks?.toFixed(1)}t · {h.max_active_tranches ?? 1} tranches max
                     </span>
                   )}
-                  <span className="text-[10px] font-mono" style={{ color: (h?.real_pnl_usd ?? h?.pnl_usd) >= 0 ? C.green : C.red }}>
-                    PnL {ppm(h.real_pnl_usd ?? h.pnl_usd, 4)} USD
+                  <span className="text-[10px] font-mono font-bold" style={{ color: pnlDisplay >= 0 ? C.green : C.red }}>
+                    MTM {ppm(pnlDisplay, 4)} USD
                   </span>
                 </div>
               )}
@@ -567,10 +632,18 @@ function HoldingsPanel({ holdings }) {
         ))}
         {/* Totals row */}
         <div className="flex items-center justify-between px-4 py-3" style={{ background: C.surface2 }}>
-          <span className="text-xs font-semibold" style={{ color: C.muted }}>TOTAL NOTIONAL</span>
-          <span className="text-sm font-mono font-bold" style={{ color: C.amber }}>
-            ${totalNotional.toFixed(3)}
-          </span>
+          <div className="flex items-center gap-4">
+            <div>
+              <div className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>TOTAL NOTIONAL</div>
+              <div className="text-sm font-mono font-bold" style={{ color: C.amber }}>${totalNotional.toFixed(3)}</div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>TOTAL MTM PnL</div>
+              <div className="text-sm font-mono font-bold" style={{ color: totalMtmPnl >= 0 ? C.green : C.red }}>
+                {ppm(totalMtmPnl, 4)} USD
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </Panel>
@@ -758,24 +831,37 @@ function PnlChart({ chart }) {
 
 // ── KPI Bar ───────────────────────────────────────────────────────────────────
 
-function KpiBar({ kpis }) {
+function KpiBar({ kpis, holdings, cadence }) {
   const k = kpis ?? {};
+
+  // Total live MTM PnL across all coins (baseline-adjusted)
+  const totalMtm = Object.values(holdings ?? {}).reduce((s, h) => s + (h?.pnl_mtm ?? 0), 0);
+
+  // Total live trips across all coins in the current 3-min window
+  const totalTrips3min = Object.values(cadence ?? {}).reduce((s, c) => s + (c?.trips_3min ?? 0), 0);
+  const totalTarget3min = Object.keys(cadence ?? {}).length * 15; // 15 per coin
+
   return (
     <div
       className="flex flex-wrap gap-6 px-6 py-3 border-b"
       style={{ background: C.surface2, borderColor: C.border }}
     >
       <Stat label="Trades (24h)"      value={k.daily_trades ?? '—'} />
-      <Stat label="Total Net PnL"     value={`${ppm(k.total_net_pnl, 4)} USD`}
+      <Stat label="Realised PnL (24h)"
+            value={`${ppm(k.total_net_pnl, 4)} USD`}
             color={(k.total_net_pnl ?? 0) >= 0 ? C.green : C.red} />
+      <Stat label="Live MTM PnL"
+            value={`${ppm(totalMtm, 4)} USD`}
+            color={totalMtm >= 0 ? C.green : C.red} />
       <Stat label="Avg PnL / Trade"   value={`${ppm(k.avg_pnl_per_trade, 4)} USD`}
             color={(k.avg_pnl_per_trade ?? 0) >= 0 ? C.green : C.red} />
       <Stat label="Win Rate (24h)"    value={`${pp(k.win_rate_pct, 1)}%`}
             color={(k.win_rate_pct ?? 0) >= 50 ? C.green : C.red} />
       <Stat label="Round Trips (24h)" value={`${k.round_trips ?? 0}`}
             color={C.teal} />
-      <Stat label="RL Cadence Target" value="15 / 3min"
-            color={C.muted} />
+      <Stat label="Live Trips / 3min (all)"
+            value={`${totalTrips3min} / ${totalTarget3min}`}
+            color={totalTrips3min >= totalTarget3min ? C.green : totalTrips3min >= totalTarget3min * 0.5 ? C.amber : C.red} />
     </div>
   );
 }
@@ -907,7 +993,7 @@ function RewardHistory({ data, pendingCount }) {
             {!data?.length ? (
               <tr>
                 <td colSpan={RH.length} className="px-3 py-10 text-center text-sm" style={{ color: C.muted }}>
-                  No evaluated cycles yet. Rewards back-filled 60s after each decision.
+                  No evaluated cycles yet. Rewards scored 3 minutes after each decision.
                 </td>
               </tr>
             ) : (
@@ -987,8 +1073,10 @@ export default function App() {
   const [snapshot,        setSnapshot]        = useState(null);
   const [rewardHist,      setRewardHist]      = useState([]);
   const [rewardPending,   setRewardPending]   = useState(0);
+  const [cadence,         setCadence]         = useState({});
   const [wsStatus,        setWsStatus]        = useState('connecting'); // 'connecting' | 'live' | 'error'
   const [lastUpdate,      setLastUpdate]      = useState(null);
+  const [resetting,       setResetting]       = useState(false);
   const wsRef = useRef(null);
 
   // Reward history — low-frequency REST poll (every 30s)
@@ -1037,6 +1125,8 @@ export default function App() {
           // Reward history is now included in the snapshot push — update inline
           if (parsed.reward_history?.length) setRewardHist(parsed.reward_history);
           if (parsed.reward_pending_count != null) setRewardPending(parsed.reward_pending_count);
+          // Live cadence from snapshot
+          if (parsed.cadence) setCadence(parsed.cadence);
         } catch (_) {}
       };
       ws.onerror = () => setWsStatus('error');
@@ -1060,6 +1150,19 @@ export default function App() {
     const id = setInterval(fetchSnapshot, 5000);
     return () => clearInterval(id);
   }, [wsStatus, fetchSnapshot]);
+
+  // Reset PnL baselines — POST to backend, then force a snapshot refresh
+  const handleResetPnl = useCallback(async () => {
+    if (resetting) return;
+    setResetting(true);
+    try {
+      await fetch('/api/reset-pnl', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      // Pull a fresh snapshot so MTM PnL immediately shows 0
+      await fetchSnapshot();
+    } catch (_) {} finally {
+      setResetting(false);
+    }
+  }, [resetting, fetchSnapshot]);
 
   // Reward history — independent slow poll
   useEffect(() => {
@@ -1122,7 +1225,7 @@ export default function App() {
       </div>
 
       {/* ── KPI Bar ── */}
-      <KpiBar kpis={d.kpis} />
+      <KpiBar kpis={d.kpis} holdings={d.holdings} cadence={cadence} />
 
       {/* ── Symbol Strips ── */}
       <div className="shrink-0 border-b" style={{ borderColor: C.border }}>
@@ -1142,12 +1245,12 @@ export default function App() {
 
         {/* Agent Q Intelligence — col 1 */}
         <div style={{ gridColumn: '1', gridRow: '1 / 3' }}>
-          <AgentQPanel agentQ={d.agent_q} rewardHistory={rewardHist} />
+          <AgentQPanel agentQ={d.agent_q} rewardHistory={rewardHist} cadence={cadence} />
         </div>
 
         {/* Holdings — col 2 */}
         <div style={{ gridColumn: '2', gridRow: '1' }}>
-          <HoldingsPanel holdings={d.holdings} />
+          <HoldingsPanel holdings={d.holdings} onResetPnl={handleResetPnl} />
         </div>
 
         {/* Order Queue — col 3 */}

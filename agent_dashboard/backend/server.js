@@ -99,14 +99,36 @@ async function getHoldings() {
         // Real inventory from orders key (exchange-reconciled); pipeline = shadow ledger
         const realInventory = o ? parseFloat(o.real_inventory ?? 0) : null;
 
+        const inventoryCoin = parseFloat(p.inventory_coin ?? 0);
+        const microPrice    = parseFloat(p.micro_price   ?? 0);
+        const pnlUsd        = parseFloat(p.pnl_usd ?? 0);
+        const realPnlUsd    = o ? parseFloat(o.real_pnl_usd ?? 0) : null;
+
+        // Mark-to-market PnL: cash-flow PnL + current market value of open inventory.
+        // pnl_usd alone goes deeply negative while holding (buying drains cash).
+        // MTM corrects this: pnl_mtm = 0 at break-even, positive when profitable.
+        const pnlMtm     = pnlUsd + inventoryCoin * microPrice;
+        const realPnlMtm = realPnlUsd !== null ? realPnlUsd + inventoryCoin * microPrice : null;
+
+        // PnL baseline (user-triggered reset). Stored per-symbol in Redis.
+        let pnlBaseline = 0.0;
+        try {
+          const rawBase = await redis.get(`dashboard:pnl_baseline:${sym}`);
+          if (rawBase) pnlBaseline = parseFloat(rawBase);
+        } catch (_) {}
+
         holdings[sym] = {
           // Shadow ledger (HFT internal model — may lag exchange reconciliation)
-          inventory_coin:      parseFloat(p.inventory_coin ?? 0),
+          inventory_coin:      inventoryCoin,
           // Real exchange inventory (from periodic balance reconciliation, null if stale)
           real_inventory:      realInventory,
-          pnl_usd:             parseFloat(p.pnl_usd      ?? 0),
-          real_pnl_usd:        o ? parseFloat(o.real_pnl_usd ?? 0) : null,
-          micro_price:         parseFloat(p.micro_price   ?? 0),
+          pnl_usd:             pnlUsd,
+          real_pnl_usd:        realPnlUsd,
+          // Mark-to-market PnL (correct view: includes open position value)
+          pnl_mtm:             pnlMtm - pnlBaseline,
+          real_pnl_mtm:        realPnlMtm !== null ? realPnlMtm - pnlBaseline : null,
+          pnl_baseline:        pnlBaseline,
+          micro_price:         microPrice,
           lob_bid:             parseFloat(p.lob_bid       ?? 0),
           lob_ask:             parseFloat(p.lob_ask       ?? 0),
           obi:                 parseFloat(p.obi           ?? 0),
@@ -292,6 +314,43 @@ async function getChart() {
   }
 }
 
+// Per-symbol round-trips in the last 3-minute RL window (cadence tracking)
+async function getLiveCadence() {
+  try {
+    const result = await pool.query(`
+      SELECT
+        symbol,
+        COUNT(*) FILTER (WHERE side = 'SELL')::int   AS trips_3min,
+        COUNT(*)::int                                  AS fills_3min,
+        COALESCE(SUM(net_pnl_usd), 0)                AS pnl_3min,
+        COALESCE(
+          100.0 * SUM(CASE WHEN net_pnl_usd > 0 THEN 1 ELSE 0 END)::float
+          / NULLIF(COUNT(*) FILTER (WHERE side = 'SELL'), 0),
+          0
+        )                                              AS wr_3min
+      FROM execution_log
+      WHERE timestamp > NOW() - INTERVAL '3 minutes'
+      GROUP BY symbol
+    `);
+    const cadence = {};
+    SYMBOLS.forEach((s) => { cadence[s] = { trips_3min: 0, fills_3min: 0, pnl_3min: 0, wr_3min: 0 }; });
+    result.rows.forEach((r) => {
+      cadence[r.symbol] = {
+        trips_3min: r.trips_3min   || 0,
+        fills_3min: r.fills_3min   || 0,
+        pnl_3min:   parseFloat(r.pnl_3min)  || 0,
+        wr_3min:    parseFloat(r.wr_3min)   || 0,
+      };
+    });
+    return cadence;
+  } catch (e) {
+    console.error('[LiveCadence] query error:', e.message);
+    const cadence = {};
+    SYMBOLS.forEach((s) => { cadence[s] = { trips_3min: 0, fills_3min: 0, pnl_3min: 0, wr_3min: 0 }; });
+    return cadence;
+  }
+}
+
 async function getRewardHistory(limit = 50) {
   try {
     // Only return evaluated rows (evaluated_at IS NOT NULL) so the scorecard
@@ -327,7 +386,7 @@ async function getRewardHistory(limit = 50) {
 }
 
 async function getFullSnapshot() {
-  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory] = await Promise.all([
+  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory, cadence] = await Promise.all([
     getHoldings(),
     getOrders(),
     getLastFills(),
@@ -336,12 +395,13 @@ async function getFullSnapshot() {
     getTrades(100),
     getChart(),
     getRewardHistory(50),
+    getLiveCadence(),
   ]);
 
-  // Compute per-symbol cumulative PnL from holdings (live engine data)
+  // Compute per-symbol cumulative PnL from holdings (MTM — mark-to-market)
   const livePnl = {};
   SYMBOLS.forEach((sym) => {
-    if (holdings[sym]) livePnl[sym] = holdings[sym].pnl_usd;
+    if (holdings[sym]) livePnl[sym] = holdings[sym].pnl_mtm;
   });
 
   return {
@@ -357,6 +417,7 @@ async function getFullSnapshot() {
     symbols:               SYMBOLS,
     reward_history:        rewardHistory.rows,
     reward_pending_count:  rewardHistory.pending_count,
+    cadence,
   };
 }
 
@@ -423,6 +484,35 @@ app.get('/api/reward-history', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit ?? '50', 10), 200);
   try { res.json(await getRewardHistory(limit)); }  // returns { rows, pending_count }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/cadence', async (_req, res) => {
+  try { res.json(await getLiveCadence()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/reset-pnl  — zeroes the PnL baseline for all (or one) symbol.
+// Body (optional): { symbol: "ETHFDUSD" }  — omit to reset all.
+app.post('/api/reset-pnl', async (req, res) => {
+  try {
+    const { symbol } = req.body ?? {};
+    const targets = symbol ? [symbol] : SYMBOLS;
+    const h = await getHoldings();
+    await Promise.all(
+      targets.map(async (sym) => {
+        const hd = h[sym];
+        if (!hd) return;
+        // Baseline = current MTM so display starts at 0
+        const baseline = hd.pnl_mtm + (hd.pnl_baseline ?? 0); // remove old baseline first
+        await redis.set(`dashboard:pnl_baseline:${sym}`, baseline.toFixed(8));
+      })
+    );
+    console.log(`[PnL Reset] Zeroed: ${targets.join(', ')}`);
+    res.json({ ok: true, reset: targets });
+  } catch (e) {
+    console.error('[PnL Reset] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
