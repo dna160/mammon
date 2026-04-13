@@ -44,7 +44,7 @@ logging.basicConfig(
 log = logging.getLogger("agent_q")
 
 ORACLE_INTERVAL_S   = int(os.getenv("ORACLE_INTERVAL_S",   str(5 * 60)))    # 5  min
-TACTICAL_INTERVAL_S = int(os.getenv("TACTICAL_INTERVAL_S", str(1 * 60)))    # 1  min
+TACTICAL_INTERVAL_S = int(os.getenv("TACTICAL_INTERVAL_S", str(3 * 60)))    # 3  min (V2.2 cadence mandate)
 WATCHER_INTERVAL_S  = float(os.getenv("WATCHER_INTERVAL_S", "1.0"))         # 1  sec
 
 ACTIVE_SYMBOLS = [

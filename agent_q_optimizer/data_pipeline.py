@@ -1,5 +1,5 @@
 """
-Data Pipeline — Institutional State Vector (V2 PRD).
+Data Pipeline — Institutional State Vector (V2.2 PRD).
 
 Architecture:
   1. Per-symbol in-memory rolling window (≤300 data points, ~1s cadence = 5 min).
@@ -9,11 +9,11 @@ Architecture:
      so the telemetry dashboard can display live state vectors without DB queries.
 
 Metrics:
-  A. vol_bps      — Micro-Volatility in Basis Points (std of 1s returns × 10000)
-  B. tfi_zscore   — TFI Z-Score: (current_tfi − mean_tfi) / std_tfi
-  C. drift_bps    — Micro-Trend Drift in BPS over the window (total price change)
-  D. native_spread — Native LOB Spread in ticks (5m average of spread/tick_size)
-  E. adverse_pct  — Adverse Selection % (% of fills with negative PnL from Postgres)
+  A. vol_bps       — Micro-Volatility in Basis Points
+  B. tfi_zscore    — TFI Z-Score
+  C. drift_bps     — Micro-Trend Drift in BPS over the window
+  D. native_spread — Native LOB Spread in ticks (5m average)
+  E. adverse_pct   — Adverse Selection % from execution_log
 """
 import os
 import json
@@ -62,10 +62,7 @@ def _ensure_history(symbol: str) -> deque:
 
 
 def _fetch_latest_tick(symbol: str) -> Tuple[float, float, float]:
-    """
-    Pull latest (price, tfi, spread_ticks) from Redis.
-    Returns (0.0, 0.0, 5.0) on any error.
-    """
+    """Pull latest (price, tfi, spread_ticks) from Redis."""
     try:
         r         = _get_redis()
         tick_size = TICK_SIZES.get(symbol, 0.0001)
@@ -127,7 +124,7 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
 
     Samples the latest Redis tick into the rolling history, computes 5
     institutional metrics, returns the compressed 5-line string for LLM injection,
-    and [V2] publishes structured JSON to cognitive:state_vector:{symbol.lower()}.
+    and publishes structured JSON to cognitive:state_vector:{symbol.lower()}.
     """
     sym  = symbol.upper()
     hist = _ensure_history(sym)
@@ -171,7 +168,7 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
     adv_label   = "DANGER (Run Over)" if adverse_selection_pct > 60 else \
                   "SAFE (Capturing Spread)"
 
-    # ── 4. [V2] Publish structured JSON to Redis for dashboard ───────────────
+    # ── 4. Publish structured JSON to Redis for dashboard ────────────────────
     try:
         structured = {
             "symbol":            sym,
@@ -192,7 +189,7 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
         r.set(
             f"cognitive:state_vector:{sym.lower()}",
             json.dumps(structured),
-            ex=600,   # 10-min TTL — stale if pipeline stops
+            ex=600,   # 10-min TTL
         )
     except Exception as e:
         log.warning("[%s] State vector Redis publish failed: %s", sym, e)
@@ -209,10 +206,7 @@ def get_state_vector(symbol: str, window_minutes: int = 5) -> str:
 
 
 def get_state_vector_structured(symbol: str, window_minutes: int = 5) -> dict:
-    """
-    Returns structured metrics dict (after calling get_state_vector to populate cache).
-    Used by parameter_tuner to capture metrics for agent_q_memory logging.
-    """
+    """Returns structured metrics dict for agent_q_memory logging."""
     sym  = symbol.upper()
     hist = _ensure_history(sym)
 
@@ -235,47 +229,55 @@ def get_state_vector_structured(symbol: str, window_minutes: int = 5) -> dict:
         pass
 
     return {
-        "vol_bps":      vol_bps,
-        "tfi_zscore":   tfi_zscore,
-        "drift_bps":    drift_bps,
+        "vol_bps":       vol_bps,
+        "tfi_zscore":    tfi_zscore,
+        "drift_bps":     drift_bps,
         "native_spread": native_spread,
-        "adverse_pct":  adverse_selection_pct,
+        "adverse_pct":   adverse_selection_pct,
     }
 
 
-def fetch_telemetry_window(symbol: str, window_minutes: int = 15) -> str:
+def fetch_telemetry_window(symbol: str, window_minutes: int = 3) -> str:
     """Backward-compat shim — delegates to get_state_vector()."""
     return get_state_vector(symbol, window_minutes=window_minutes)
 
 
-# ── RL Hyper-Cadence Reward Function (PRD §4) ─────────────────────────────────
+# ── Hyper-Cadence Reward Function (V2.2 PRD §3B) ─────────────────────────────
 
 def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> float:
     """
-    RenTech-Style Cadence Reward Function.
+    V2.2 Velocity-First Reward Function — 3-minute evaluation cycle.
 
-    Priority 1: Volume   — target 15 round trips per 1m cycle (multi-tranche cadence).
-                           Exponential penalty below 15, logarithmic bonus above.
-    Priority 2: Win Rate — (win_rate - 0.5) * 100  → range [-50, +50]
-    Priority 3: PnL      — net_pnl × 10 (linear reinforcement).
+    Priority 1: Volume (Capital Velocity).
+      Target = 15 round trips per 3-minute cycle.
+      SEVERE linear punishment for starvation/bag-holding.
+      Below 15: score = -200 × (1 − trips/15)  → max penalty -200 at 0 trips
+      Above 15: score = 50  + (trips − 15) × 2  → bonus for hyper-cadence
 
-    Examples (1m cycle):
-       3 trades, 66% WR, +$0.01 PnL  → volume=-74.0 + wr=+16.0 + pnl=+0.1  = -57.9
-       8 trades, 50% WR, +$0.02 PnL  → volume=-42.4 + wr=  0.0 + pnl=+0.2  = -42.2
-      15 trades, 55% WR, +$0.05 PnL  → volume=  0.0 + wr= +5.0 + pnl=+0.5  =  +5.5
-      30 trades, 60% WR, +$0.10 PnL  → volume= +7.0 + wr=+10.0 + pnl=+1.0  = +18.0
+    Priority 2: Win Rate (bonus for efficiency > 50%).
+      score = (win_rate − 0.5) × 50  → range [−25, +25]
+
+    Priority 3: Realized Net PnL.
+      score = net_pnl × 10
+
+    Examples (3m cycle):
+        0 trades, 50% WR,  $0.00  → vol=-200 + wr=  0 + pnl=  0 = -200.0
+        3 trades, 50% WR,  $0.00  → vol=-160 + wr=  0 + pnl=  0 = -160.0
+       15 trades, 55% WR, +$0.05  → vol=  50 + wr=+2.5 + pnl=+0.5 = +53.0
+       30 trades, 60% WR, +$0.10  → vol=  80 + wr=+5.0 + pnl=+1.0 = +86.0
     """
-    import math
-    target_trades = 15.0   # Adjusted for 1-minute multi-tranche cycle
+    target_trades = 15.0  # 15 round trips per 3-minute cycle
 
-    # 1. Volume Score — brutal punishment for < 15 trades
+    # 1. Volume / Capital Velocity Score
     if round_trips < target_trades:
-        volume_score = -100.0 * ((1.0 - (round_trips / target_trades)) ** 2)
+        # Linear punishment — brutal for bag-holding
+        volume_score = -200.0 * (1.0 - (round_trips / target_trades))
     else:
-        volume_score = 50.0 * math.log10(1 + (round_trips - target_trades))
+        # Linear bonus above target — reward hyper-cadence
+        volume_score = 50.0 + (round_trips - target_trades) * 2.0
 
-    # 2. Win Rate Score — centred on 50%
-    win_rate_score = (win_rate - 0.5) * 100.0
+    # 2. Win Rate Score (centred on 50%)
+    win_rate_score = (win_rate - 0.5) * 50.0
 
     # 3. PnL Score — linear reinforcement
     pnl_score = net_pnl * 10.0
@@ -283,14 +285,11 @@ def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> fl
     return volume_score + win_rate_score + pnl_score
 
 
-def get_rl_metrics_for_symbol(symbol: str, window_minutes: int = 1) -> dict:
+def get_rl_metrics_for_symbol(symbol: str, window_minutes: int = 3) -> dict:
     """
-    Query execution_log for the most recent `window_minutes` window and return:
-      - round_trips   : number of completed SELL fills (each closes a BUY position)
-      - win_rate      : fraction of SELL fills with net_pnl_usd > 0  (0.0–1.0)
-      - net_pnl       : total net PnL in USD over the window (all fills)
-    Used by parameter_tuner.py to compute T-1 RL reward.
-    Reads from execution_log (primary) which has symbol, side, net_pnl_usd.
+    Query execution_log for the most recent `window_minutes` window.
+    Returns round_trips, win_rate, net_pnl.
+    Default window is 3 minutes (V2.2 cadence mandate).
     """
     try:
         conn = psycopg2.connect(DB_DSN, connect_timeout=5)
@@ -325,14 +324,14 @@ def get_last_cycle_reward_string(symbol: str) -> str:
     """
     Return the most recent evaluated agent_q_memory row for `symbol` as a
     human-readable string for injection into the Alpha LLM prompt.
-
-    Returns a default 'No history yet' string when the table is empty.
+    Includes grid_offset_ticks and max_active_tranches for the AI to learn from.
     """
     try:
         conn = psycopg2.connect(DB_DSN, connect_timeout=5)
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute("""
-                SELECT reward_score, total_round_trips, win_rate_pct, net_pnl
+                SELECT reward_score, total_round_trips, win_rate_pct, net_pnl,
+                       max_active_tranches, grid_offset_ticks, obi_threshold
                 FROM   agent_q_memory
                 WHERE  symbol       = %s
                   AND  evaluated_at IS NOT NULL
@@ -343,13 +342,17 @@ def get_last_cycle_reward_string(symbol: str) -> str:
         conn.close()
 
         if row:
-            sign = "+" if row["net_pnl"] >= 0 else ""
-            wr   = row["win_rate_pct"] or 0.0
+            sign    = "+" if row["net_pnl"] >= 0 else ""
+            wr      = row["win_rate_pct"] or 0.0
+            tranches = row["max_active_tranches"] or 1
+            offset  = row["grid_offset_ticks"] or 2.0
+            obi     = row["obi_threshold"] or 1.0
             return (
                 f"Reward: {row['reward_score']:.1f} | "
-                f"Trades: {row['total_round_trips']} | "
-                f"Win Rate: {wr:.0f}% | "
-                f"PnL: {sign}${row['net_pnl']:.2f}"
+                f"Trades: {row['total_round_trips']}/15 | "
+                f"WR: {wr:.0f}% | "
+                f"PnL: {sign}${row['net_pnl']:.2f} | "
+                f"Tranches: {tranches} | Offset: {offset:.1f}t | OBI: {obi:.2f}"
             )
     except Exception as e:
         log.warning("[%s] Last cycle reward query failed: %s", symbol, e)

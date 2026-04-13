@@ -1,4 +1,4 @@
--- Project Mammon V2 — Master Schema
+-- Project Mammon V2.2 — Master Schema
 -- PostgreSQL 15 + TimescaleDB
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
@@ -49,37 +49,57 @@ CREATE INDEX IF NOT EXISTS idx_engine_d_telemetry_time
 CREATE INDEX IF NOT EXISTS idx_engine_d_telemetry_symbol_time
     ON engine_d_telemetry (symbol, timestamp DESC);
 
--- ── Agent Q Memory — RAG Hippocampus (PRD §5) ─────────────────────────────────
--- Each row = one 15-min tactical parameter decision + its measured outcome.
--- reward_score is back-filled 15 minutes after parameters are injected.
+-- ── Agent Q Memory — RAG Hippocampus (V2.2 PRD §2) ───────────────────────────
+-- Each row = one 3-minute tactical parameter decision + its measured outcome.
+-- reward_score is back-filled 3 minutes after parameters are injected.
 -- This table IS the self-learning memory injected into future LLM prompts.
 
 CREATE TABLE IF NOT EXISTS agent_q_memory (
-    id                 SERIAL PRIMARY KEY,
-    timestamp          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    evaluated_at       TIMESTAMPTZ,                    -- when reward was scored
-    symbol             VARCHAR(20)  NOT NULL,
-    regime             VARCHAR(50)  NOT NULL,          -- Oracle regime at time of decision
-    -- Actions proposed by Alpha + approved by CRO
-    proposed_gamma         FLOAT   NOT NULL DEFAULT 0,
-    proposed_min_spread    FLOAT   NOT NULL DEFAULT 0,
-    tfi_threshold          FLOAT   NOT NULL DEFAULT 0,
+    id                    SERIAL PRIMARY KEY,
+    timestamp             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    evaluated_at          TIMESTAMPTZ,                   -- when reward was scored (3m later)
+    symbol                VARCHAR(20)  NOT NULL,
+    regime                VARCHAR(50)  NOT NULL,         -- Oracle regime at time of decision
+    -- AI Levers / Actions (proposed by Alpha, approved by CRO)
+    proposed_gamma        FLOAT NOT NULL DEFAULT 0,      -- reservation-price aversion
+    proposed_min_spread   FLOAT NOT NULL DEFAULT 0,      -- min spread in ticks
+    tfi_threshold         FLOAT NOT NULL DEFAULT 0,      -- toxic-flow breaker (USD notional)
+    max_active_tranches   INT   NOT NULL DEFAULT 1,      -- grid depth (1=ping-pong, 10=full)
+    obi_threshold         FLOAT NOT NULL DEFAULT 1.0,    -- momentum shield (0=conservative, 1=permissive)
+    grid_offset_ticks     FLOAT NOT NULL DEFAULT 2.0,    -- spacing between grid tranches (ticks)
     -- State vector snapshot at time of decision
-    vol_bps            FLOAT   NOT NULL DEFAULT 0,     -- Micro-Volatility
-    tfi_zscore         FLOAT   NOT NULL DEFAULT 0,     -- Order Flow Z-Score
-    drift_bps          FLOAT   NOT NULL DEFAULT 0,     -- Market Drift
-    native_spread      FLOAT   NOT NULL DEFAULT 0,     -- LOB Spread (ticks)
-    -- Outcomes (back-filled after 15 min) — RL Hyper-Cadence metrics
-    total_round_trips  INT     NOT NULL DEFAULT 0,   -- filled round trips in the 15m window
-    win_rate_pct       FLOAT   NOT NULL DEFAULT 0.0, -- % of profitable round trips
-    net_pnl            FLOAT   NOT NULL DEFAULT 0,
-    adverse_selection  FLOAT   NOT NULL DEFAULT 0,
-    reward_score       FLOAT   NOT NULL DEFAULT 0,   -- RenTech RL score (vol+winrate+pnl)
-    -- LLM reasoning (for display)
-    alpha_reasoning    TEXT,
-    cro_reasoning      TEXT,
-    override_applied   BOOLEAN NOT NULL DEFAULT FALSE
+    vol_bps               FLOAT NOT NULL DEFAULT 0,      -- Micro-Volatility (BPS)
+    tfi_zscore            FLOAT NOT NULL DEFAULT 0,      -- Order Flow Z-Score
+    drift_bps             FLOAT NOT NULL DEFAULT 0,      -- Market Drift (BPS)
+    native_spread         FLOAT NOT NULL DEFAULT 0,      -- LOB Spread (ticks, 5m avg)
+    -- Outcomes (back-filled 3 min later)
+    total_round_trips     INT   NOT NULL DEFAULT 0,      -- SELL fills in the 3m window
+    win_rate_pct          FLOAT NOT NULL DEFAULT 0.0,    -- % of profitable round trips
+    net_pnl               FLOAT NOT NULL DEFAULT 0,      -- realized PnL in the window
+    adverse_selection     FLOAT NOT NULL DEFAULT 0,      -- % of fills with negative PnL
+    reward_score          FLOAT NOT NULL DEFAULT 0,      -- Hyper-Cadence RL score
+    -- LLM reasoning (for display + RAG retrieval)
+    alpha_reasoning       TEXT,
+    cro_reasoning         TEXT,
+    override_applied      BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- ── Live migration: add new V2.2 columns if upgrading from V2.1 ───────────────
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='agent_q_memory' AND column_name='max_active_tranches') THEN
+        ALTER TABLE agent_q_memory ADD COLUMN max_active_tranches INT NOT NULL DEFAULT 1;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='agent_q_memory' AND column_name='obi_threshold') THEN
+        ALTER TABLE agent_q_memory ADD COLUMN obi_threshold FLOAT NOT NULL DEFAULT 1.0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='agent_q_memory' AND column_name='grid_offset_ticks') THEN
+        ALTER TABLE agent_q_memory ADD COLUMN grid_offset_ticks FLOAT NOT NULL DEFAULT 2.0;
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_agent_q_memory_symbol_time
     ON agent_q_memory (symbol, timestamp DESC);
@@ -87,9 +107,11 @@ CREATE INDEX IF NOT EXISTS idx_agent_q_memory_symbol_time
 CREATE INDEX IF NOT EXISTS idx_agent_q_memory_regime
     ON agent_q_memory (regime, reward_score DESC);
 
+CREATE INDEX IF NOT EXISTS idx_agent_q_memory_evaluated
+    ON agent_q_memory (evaluated_at DESC NULLS LAST);
+
 -- ── Execution Log — individual fill records ───────────────────────────────────
 -- Written by the Rust engine via UDS (executionReport) events.
--- This is separate from trade_telemetry (which is the agent-level view).
 
 CREATE TABLE IF NOT EXISTS execution_log (
     id               BIGSERIAL,
@@ -112,3 +134,6 @@ SELECT create_hypertable('execution_log', 'timestamp', if_not_exists => TRUE);
 
 CREATE INDEX IF NOT EXISTS idx_execution_log_symbol_time
     ON execution_log (symbol, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_log_side_time
+    ON execution_log (side, timestamp DESC);

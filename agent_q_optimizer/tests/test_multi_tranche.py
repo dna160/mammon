@@ -1,6 +1,6 @@
 """
-Tests for Multi-Tranche Scaling PRD:
-  1. RL reward target reduced to 15 round-trips/min
+Tests for Multi-Tranche Scaling (updated for V2.2 PRD linear reward formula):
+  1. RL reward target = 15 round-trips per 3-min cycle (linear cadence score)
   2. max_active_tranches flows correctly through redis_bridge publish_params
   3. safe_mode payload includes max_active_tranches=1
   4. json_sanitizer correctly parses max_active_tranches from LLM output
@@ -16,48 +16,40 @@ from data_pipeline import calculate_rl_reward
 from json_sanitizer import extract_json
 
 
-# ── 1. RL Reward: target is now 15 trades/min ─────────────────────────────────
+# ── 1. RL Reward: V2.2 linear formula, 3-min target of 15 trips ───────────────
 
 def test_reward_zero_trades_scores_minus_100_volume():
-    """0 trades → volume_score = -100 * (1 - 0/15)^2 = -100"""
-    reward = calculate_rl_reward(round_trips=0, win_rate=0.0, net_pnl=0.0)
-    # volume=-100, win_rate=-50, pnl=0  → -150
-    assert reward == -150.0, f"Expected -150, got {reward}"
+    """V2.2: 0 trades, 50% WR → volume=-200×(1-0/15)=-200, wr=0, pnl=0 → -200"""
+    reward = calculate_rl_reward(round_trips=0, win_rate=0.5, net_pnl=0.0)
+    assert abs(reward - (-200.0)) < 0.01, f"Expected -200, got {reward}"
 
 def test_reward_15_trades_hits_target():
-    """Exactly 15 trades → volume_score = 0, neutral win rate → total = 0"""
+    """V2.2: exactly 15 trades, 50% WR → volume=50, wr=0, pnl=0 → +50.0"""
     reward = calculate_rl_reward(round_trips=15, win_rate=0.5, net_pnl=0.0)
-    assert reward == 0.0, f"Expected 0.0, got {reward}"
+    assert abs(reward - 50.0) < 0.01, f"Expected 50.0, got {reward}"
 
 def test_reward_15_trades_good_wr_positive():
-    """15 trades, 60% WR, +$0.05 PnL → should be positive"""
+    """15 trades, 60% WR, +$0.05 PnL → volume=50 + wr=5 + pnl=0.5 = 55.5"""
     reward = calculate_rl_reward(round_trips=15, win_rate=0.6, net_pnl=0.05)
-    # volume=0, wr=+10, pnl=+0.5 → +10.5
     assert reward > 0, f"Expected positive reward, got {reward}"
-    assert abs(reward - 10.5) < 0.01, f"Expected ~10.5, got {reward}"
+    assert abs(reward - 55.5) < 0.01, f"Expected ~55.5, got {reward}"
 
 def test_reward_3_trades_partial_penalty():
-    """3 trades (20% of target) → volume penalty not max"""
+    """V2.2: 3 trades (20% of target) → volume = -200×(1-3/15) = -160"""
     reward = calculate_rl_reward(round_trips=3, win_rate=0.5, net_pnl=0.0)
-    # volume = -100 * (1 - 3/15)^2 = -100 * 0.64 = -64
-    assert -70 < reward < -60, f"Expected ~-64, got {reward}"
+    assert abs(reward - (-160.0)) < 0.01, f"Expected -160.0, got {reward}"
 
 def test_reward_30_trades_logarithmic_bonus():
-    """30 trades (2× target) → logarithmic bonus above target"""
+    """V2.2: 30 trades → volume = 50 + (30-15)×2 = 80; wr=0; pnl=0 → 80.0"""
     reward = calculate_rl_reward(round_trips=30, win_rate=0.5, net_pnl=0.0)
-    import math
-    volume_score = 50.0 * math.log10(1 + (30 - 15))
-    expected = volume_score + 0.0 + 0.0
-    assert abs(reward - expected) < 0.01, f"Expected {expected:.2f}, got {reward:.2f}"
+    assert abs(reward - 80.0) < 0.01, f"Expected 80.00, got {reward:.2f}"
 
 def test_reward_pnl_is_linear():
-    """PnL score = net_pnl * 10 (no asymmetric factor)"""
+    """PnL score = net_pnl × 10. At 15 trips: volume=50, wr=0, pnl=±10."""
     r_pos = calculate_rl_reward(round_trips=15, win_rate=0.5, net_pnl=1.0)
     r_neg = calculate_rl_reward(round_trips=15, win_rate=0.5, net_pnl=-1.0)
-    # pos: 0 + 0 + 10.0 = +10
-    # neg: 0 + 0 + (-10.0) = -10
-    assert abs(r_pos - 10.0) < 0.01, f"Expected +10.0, got {r_pos}"
-    assert abs(r_neg - (-10.0)) < 0.01, f"Expected -10.0, got {r_neg}"
+    assert abs(r_pos - 60.0) < 0.01, f"Expected +60.0, got {r_pos}"
+    assert abs(r_neg - 40.0)  < 0.01, f"Expected +40.0, got {r_neg}"
 
 
 # ── 2. JSON sanitizer: parses max_active_tranches ─────────────────────────────

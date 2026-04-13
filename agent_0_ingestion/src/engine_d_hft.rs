@@ -1,78 +1,55 @@
 //! Engine D — Avellaneda-Stoikov HFT Market Maker (multi-coin, Binance).
 //!
-//! Instantiate one HFTEngine per trading pair; each carries its own exchange
-//! physics (tick_size, lot_step, max_inventory_coin) so the AS math scales
-//! correctly across BTC, ADA, DOT, DOGE, and XRP simultaneously.
-//!
-//! Mathematical framework:
+//! Mathematical framework (V2.2 — Institutional Math Hardened):
 //!   F1  Micro-Price:    P_micro = (V_ask·P_bid + V_bid·P_ask) / (V_bid + V_ask)
-//!   F2  OBI:            (V_bid − V_ask) / (V_bid + V_ask)  ∈ [−1, +1]
-//!   F3  TFI ring-buf:   Σ V_buy_market − Σ V_sell_market  (rolling 1 s, coin)
-//!   F4  EWMA σ²:        σ²_t = 0.99·σ²_{t-1} + 0.01·(ΔP_micro)²
-//!   F5  Reservation:    r = P_micro − (q · γ · σ²)
-//!   F6  Half-spread:    δ = max(tick_size + γ·σ², tick_size · MIN_SPREAD_TICKS)
-//!                       P*_bid = snap(r − δ, tick_size)
-//!                       P*_ask = snap(r + δ, tick_size)
+//!   F2  OBI:            (V_bid − V_ask) / (V_bid + V_ask) ∈ [−1, +1]
+//!   F3  TFI (exp-decay): 5s half-life EWMA — eliminates infinite accumulation bug
+//!   F4  EWMA σ²(t):     α = 1 − exp(−dt/60)  (continuous-time, uncoupled from tick rate)
+//!   F5  Reservation:    r = P_micro − (q_skew · γ · σ²)  [spot-symmetry corrected]
+//!   F6  Spread:         δ = max(tick_size + γ·σ², tick_size · MIN_SPREAD_TICKS)
+//!   F7  Grid:           bid = snap(optimal_bid − active_tranches · tick · grid_offset_ticks)
 //!
-//! State machine (TFI shield is FIRST — overrides everything):
-//!   !warmed                          → no quotes (variance not trusted yet)
-//!   |TFI| > live_tfi_threshold       → shadow mode (pull all quotes)
+//! State machine:
+//!   !warmed              → no quotes (variance not trusted yet)
+//!   |TFI| > threshold    → shadow mode (toxic flow shield)
 //!   else multi-tranche capacity math:
 //!     active_tranches = floor(inventory_notional / $6)
-//!     bid: if active_tranches < live_max_tranches && safe_to_buy
-//!          → grid-stepped bid (base_bid - active_tranches × 2 ticks)
-//!     ask: if active_tranches > 0 && safe_to_sell
-//!          → optimal_ask.max(last_fill + 1 tick) [or break-even if stale > 600]
-//!
-//! Panic stop-loss:
-//!   inventory > 0 AND micro_price < last_fill_price * 0.9985
-//!   → is_panic = true → caller fires MARKET SELL immediately.
+//!     bid: active_tranches < max_tranches AND safe_to_buy
+//!          → grid-stepped bid (optimal_bid − active_tranches × tick × grid_offset_ticks)
+//!     ask: active_tranches > 0 AND safe_to_sell
+//!          → max(optimal_ask, last_fill + 1 tick)
+//!          → stale >600 ticks: accept break-even (last_fill_price only)
 
-// ── Module-level parameters (shared across all coin engines) ──────────────────
+// ── Module-level constants ────────────────────────────────────────────────────
 
-/// EWMA decay α for HF variance (≈ 100-tick half-life).
-const ALPHA: f64 = 0.01;
-
-// Default values for the live engine parameters (overridable via Agent Q every 1m).
 const DEFAULT_LIVE_GAMMA:          f64 = 0.8;
 const DEFAULT_LIVE_MIN_SPREAD:     f64 = 5.0;
-const DEFAULT_LIVE_TFI_THRESHOLD:  f64 = 65_000.0; // USD notional — safe default until Agent Q sets it
-/// OBI momentum shield — 1.0 = fully permissive (buy in any OBI). Agent Q tightens downward.
+const DEFAULT_LIVE_TFI_THRESHOLD:  f64 = 65_000.0;
 const DEFAULT_LIVE_OBI_THRESHOLD:  f64 = 1.0;
-/// Max concurrent $6 tranches — default 1 (strict ping-pong). Agent Q scales up to 10 in safe regimes.
 const DEFAULT_LIVE_MAX_TRANCHES:   u32 = 1;
+/// AI-controlled grid spacing. Default 2.0 ticks between each tranche.
+/// Agent Q scales this up during high-volatility to prevent allocation collapse.
+const DEFAULT_LIVE_GRID_OFFSET:    f64 = 2.0;
 
-/// Mirror of binance_rest::MIN_NOTIONAL — minimum FDUSD to place/hold a sell order.
-/// Kept in sync manually; engine uses it to detect dust traps without cross-module dep.
+/// TFI exponential decay half-life (seconds). Flow pressure decays 50% every 5s.
+const TFI_HALF_LIFE_S: f64 = 5.0;
+
+/// Continuous-time variance lookback (seconds). 60s = slow EWMA, stable estimate.
+const VAR_LOOKBACK_S: f64 = 60.0;
+
+/// Minimum FDUSD notional — engine uses to detect dust traps.
 const MIN_NOTIONAL_USD: f64 = 5.0;
 
-// ── Market Regime (injected by Oracle every 5m) ───────────────────────────────
+// ── Market Regime ─────────────────────────────────────────────────────────────
 
-/// Five-state regime classification produced by Agent Q's Oracle loop.
-/// Dictates the structural quoting playbook inside tick().
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketRegime {
-    /// Low volatility, balanced flow — standard 2-sided quoting.
     MeanReverting,
-    /// Retail momentum up — accumulate inventory, pull asks.
     RetailFrenzyUp,
-    /// Institutional distribution — shadow bids, only quote asks.
     InstitutionalAbsorptionDown,
-    /// Thin/stale book — quote both sides but spread forced ≥ 20 ticks.
     DeadZone,
-    /// Cascading liquidations — hard stop, panic-sell all inventory.
     ToxicLiquidationCascade,
 }
-
-// PANIC_DRAWDOWN removed — price-based stop-loss caused guaranteed losses
-// (fired 14 ticks below fill while iron profit floor only needs 1 tick up).
-// Stale inventory dump (ticks_held > 600) handles graceful exits instead.
-
-/// Fixed-size ring buffer for TFI rolling window (zero-allocation).
-const TFI_CAP: usize = 512;
-
-/// Rolling TFI window in milliseconds.
-const TFI_WINDOW_MS: u64 = 1_000;
 
 // ── Fill side ─────────────────────────────────────────────────────────────────
 
@@ -81,7 +58,6 @@ pub enum FillSide { Buy, Sell }
 
 // ── Tick output ───────────────────────────────────────────────────────────────
 
-/// Plain-data result of one tick.  No heap allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct TickOutput {
     pub micro_price:       f64,
@@ -98,175 +74,140 @@ pub struct TickOutput {
     pub total_trades:      u64,
     pub fill_this_tick:    Option<FillSide>,
     pub warm_ticks:        u64,
-    /// True when ToxicLiquidationCascade regime is active with long inventory.
     pub is_panic:          bool,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
-/// Avellaneda-Stoikov HFT Engine — stateful, synchronous, zero-allocation.
-///
-/// Create one per symbol via `HFTEngine::new(symbol, tick_size, lot_step, max_inv)`.
-/// Agent Q injects updated risk parameters at runtime via `update_params()`.
 pub struct HFTEngine {
-    // ── Exchange physics (per-coin, set at construction) ──────────────────────
+    // ── Exchange physics ───────────────────────────────────────────────────────
     pub symbol:             String,
     pub tick_size:          f64,
     pub lot_step:           f64,
     pub max_inventory_coin: f64,
 
-    // ── Agent Q Oracle (every 5m) — structural quoting playbook ─────────────
-    /// Current market regime — drives which sides are quoted.
+    // ── Agent Q Oracle (5m) ────────────────────────────────────────────────────
     pub current_regime: MarketRegime,
 
-    // ── Agent Q Tactical (every 1m) — live math parameters ───────────────────
-    /// Risk-aversion γ — reservation-price skew and spread width.
-    pub live_gamma:          f64,
-    /// Minimum spread in ticks — latency defense buffer.
-    pub live_min_spread:     f64,
-    /// TFI threshold — coin/s above which toxic flow is considered extreme.
-    pub live_tfi_threshold:  f64,
-    /// OBI momentum shield — Agent Q dynamically controls how much sell pressure
-    /// we tolerate before pulling bids. Range [0.0, 1.0].
-    /// safe_to_buy  = obi > -live_obi_threshold  (1.0 = permissive, 0.1 = conservative)
-    /// safe_to_sell = obi <  live_obi_threshold
-    pub live_obi_threshold:  f64,
-    /// Max concurrent tranches Agent Q allows (1–10). Each tranche ≈ $6.00 notional.
-    /// At 1 = strict ping-pong. At 10 = full grid depth using $60+ capital.
-    /// Defaults to 1; Agent Q scales up during safe regimes to hit cadence quota.
-    pub live_max_tranches:   u32,
+    // ── Agent Q Tactical (3m) — live parameters ───────────────────────────────
+    pub live_gamma:             f64,
+    pub live_min_spread:        f64,
+    pub live_tfi_threshold:     f64,
+    /// OBI momentum shield [0.0–1.0]: 1.0=permissive, 0.1=defensive.
+    pub live_obi_threshold:     f64,
+    /// Max concurrent $6 tranches [1–10]. Scales grid depth.
+    pub live_max_tranches:      u32,
+    /// AI-controlled grid spacing in ticks [1.0–50.0].
+    /// Each tranche steps the bid lower by this many ticks, preventing price collapse.
+    pub live_grid_offset_ticks: f64,
 
-    // ── Engine state ──────────────────────────────────────────────────────────
-    /// Net coin inventory.  Positive = long, negative = short.
-    pub inventory_coin: f64,
-
-    /// EWMA high-frequency variance σ² of micro-price returns (FDUSD²).
-    pub variance: f64,
-
-    /// Micro-price from the previous tick (for ΔP variance update).
+    // ── Engine state ───────────────────────────────────────────────────────────
+    pub inventory_coin:   f64,
+    pub variance:         f64,
     pub last_micro_price: f64,
+    pub last_fill_price:  f64,
+    pub open_bid:         Option<f64>,
+    pub open_ask:         Option<f64>,
+    pub pnl_usd:          f64,
+    pub total_trades:     u64,
+    pub warm_ticks:       u64,
+    /// Ticks held long — stale inventory dump gate (>600 → surrender profit floor).
+    pub ticks_held:       u64,
 
-    /// Price of the last confirmed buy fill — panic stop-loss anchor.
-    pub last_fill_price: f64,
+    // ── Fix 1: TFI Exponential Decay (replaces ring buffer) ───────────────────
+    /// Running signed USD-notional flow with 5s half-life.
+    pub tfi_rolling_sum:    f64,
+    /// Timestamp (ms) of last aggTrade — used to compute decay interval.
+    pub last_tfi_update_ms: u64,
 
-    /// Current active bid price (None = no active bid).
-    pub open_bid: Option<f64>,
-
-    /// Current active ask price (None = no active ask).
-    pub open_ask: Option<f64>,
-
-    /// Accumulated confirmed PnL in FDUSD.
-    pub pnl_usd: f64,
-
-    /// Total confirmed fills (both sides).
-    pub total_trades: u64,
-
-    /// Number of bookTicker ticks processed (warm-up gate: ≥ 20).
-    pub warm_ticks: u64,
-
-    /// Ticks held in long inventory — Stale Inventory Dump gate (PRD §5).
-    /// Resets to 0 on every BUY fill or when inventory drops to flat.
-    /// If > 600 (~60 seconds), profit floor is surrendered to free frozen capital.
-    pub ticks_held: u64,
-
-    // ── TFI ring buffer (zero-allocation) ────────────────────────────────────
-    tfi_vols: [f64; TFI_CAP],
-    tfi_ts:   [u64; TFI_CAP],
-    tfi_sign: [i8;  TFI_CAP],
-    tfi_head: usize,
-    tfi_len:  usize,
+    // ── Fix 2: Continuous-Time Variance ──────────────────────────────────────
+    /// Timestamp (ms) of last bookTicker — used to compute time-accurate alpha.
+    pub last_var_update_ms: u64,
 }
 
 impl HFTEngine {
-    /// Construct a new engine for the given symbol and exchange physics.
-    ///
-    /// * `symbol`             — e.g. "BTCFDUSD"
-    /// * `tick_size`          — minimum price increment (e.g. 0.01 for BTC)
-    /// * `lot_step`           — minimum qty increment (e.g. 0.00001 for BTC)
-    /// * `max_inventory_coin` — clamp threshold before one-sided quoting kicks in
-    pub fn new(
-        symbol:             String,
-        tick_size:          f64,
-        lot_step:           f64,
-        max_inventory_coin: f64,
-    ) -> Self {
+    pub fn new(symbol: String, tick_size: f64, lot_step: f64, max_inventory_coin: f64) -> Self {
         Self {
             symbol,
             tick_size,
             lot_step,
             max_inventory_coin,
-            current_regime:     MarketRegime::MeanReverting,
-            live_gamma:         DEFAULT_LIVE_GAMMA,
-            live_min_spread:    DEFAULT_LIVE_MIN_SPREAD,
-            live_tfi_threshold: DEFAULT_LIVE_TFI_THRESHOLD,
-            live_obi_threshold: DEFAULT_LIVE_OBI_THRESHOLD,
-            live_max_tranches:  DEFAULT_LIVE_MAX_TRANCHES,
-            inventory_coin:   0.0,
-            variance:         0.0,
-            last_micro_price: 0.0,
-            last_fill_price:  0.0,
-            open_bid:         None,
-            open_ask:         None,
-            pnl_usd:          0.0,
-            total_trades:     0,
-            warm_ticks:       0,
-            ticks_held:       0,
-            tfi_vols: [0.0; TFI_CAP],
-            tfi_ts:   [0;   TFI_CAP],
-            tfi_sign: [0;   TFI_CAP],
-            tfi_head: 0,
-            tfi_len:  0,
+            current_regime:        MarketRegime::MeanReverting,
+            live_gamma:            DEFAULT_LIVE_GAMMA,
+            live_min_spread:       DEFAULT_LIVE_MIN_SPREAD,
+            live_tfi_threshold:    DEFAULT_LIVE_TFI_THRESHOLD,
+            live_obi_threshold:    DEFAULT_LIVE_OBI_THRESHOLD,
+            live_max_tranches:     DEFAULT_LIVE_MAX_TRANCHES,
+            live_grid_offset_ticks: DEFAULT_LIVE_GRID_OFFSET,
+            inventory_coin:        0.0,
+            variance:              0.0,
+            last_micro_price:      0.0,
+            last_fill_price:       0.0,
+            open_bid:              None,
+            open_ask:              None,
+            pnl_usd:               0.0,
+            total_trades:          0,
+            warm_ticks:            0,
+            ticks_held:            0,
+            tfi_rolling_sum:       0.0,
+            last_tfi_update_ms:    0,
+            last_var_update_ms:    0,
         }
     }
 
-    /// Apply Agent Q Tactical parameters (every 1m) injected via Redis.
-    ///
-    /// Called from the main thread between ticks — no locking needed.
-    pub fn update_params(&mut self, gamma: f64, min_spread: f64, tfi_threshold: f64, obi_threshold: f64, max_tranches: u32) {
-        self.live_gamma         = gamma.clamp(0.1, 1.0);
-        self.live_min_spread    = min_spread.clamp(5.0, 50.0);
-        self.live_tfi_threshold = tfi_threshold.clamp(200.0, 150_000.0); // USD notional bounds
-        self.live_obi_threshold = obi_threshold.clamp(0.0, 1.0);         // OBI shield [0=conservative, 1=permissive]
-        self.live_max_tranches  = max_tranches.clamp(1, 10);              // Grid depth [1=ping-pong, 10=full grid]
+    /// Apply Agent Q Tactical parameters (every 3m) injected via Redis.
+    pub fn update_params(
+        &mut self,
+        gamma: f64,
+        min_spread: f64,
+        tfi_threshold: f64,
+        obi_threshold: f64,
+        max_tranches: u32,
+        grid_offset_ticks: f64,
+    ) {
+        self.live_gamma             = gamma.clamp(0.1, 1.0);
+        self.live_min_spread        = min_spread.clamp(1.0, 50.0);
+        self.live_tfi_threshold     = tfi_threshold.clamp(200.0, 200_000.0);
+        self.live_obi_threshold     = obi_threshold.clamp(0.0, 1.0);
+        self.live_max_tranches      = max_tranches.clamp(1, 10);
+        self.live_grid_offset_ticks = grid_offset_ticks.clamp(1.0, 50.0);
     }
 
     /// Apply Agent Q Oracle regime (every 5m) injected via Redis.
-    ///
-    /// Called from the main thread between ticks — no locking needed.
     pub fn update_regime(&mut self, regime: MarketRegime) {
         self.current_regime = regime;
     }
 
-    /// Insert an aggTrade into the TFI ring buffer WITHOUT computing quotes.
+    /// Insert an aggTrade into the TFI exponential rolling sum (O(1), zero-allocation).
     ///
-    /// Stores USD notional (qty × price) instead of raw coin volume so TFI
-    /// scales equally across BTC (~$85k/coin) and DOGE (~$0.09/coin).
-    /// `is_buyer_maker = true` → seller was aggressor; `false` → buyer aggressor.
+    /// Fix 1: replaces the fixed-size ring buffer with a 5s half-life EWMA.
+    /// USD notional (qty × price) normalises flow signal across all price scales.
     pub fn record_agg_trade(&mut self, qty: f64, price: f64, is_buyer_maker: bool, now_ms: u64) {
         if qty <= 0.0 || price <= 0.0 { return; }
-        let notional_volume = qty * price;   // USD notional — normalizes across all pairs
-        let sign: i8 = if !is_buyer_maker { 1 } else { -1 };
-        let idx = self.tfi_head % TFI_CAP;
-        self.tfi_vols[idx] = notional_volume;  // store notional, not raw qty
-        self.tfi_ts[idx]   = now_ms;
-        self.tfi_sign[idx] = sign;
-        self.tfi_head = (self.tfi_head + 1) % TFI_CAP;
-        if self.tfi_len < TFI_CAP { self.tfi_len += 1; }
+
+        // Decay existing sum for elapsed time since last trade.
+        let dt           = (now_ms.saturating_sub(self.last_tfi_update_ms)) as f64 / 1_000.0;
+        let decay_factor = (-dt * std::f64::consts::LN_2 / TFI_HALF_LIFE_S).exp();
+        self.tfi_rolling_sum   *= decay_factor;
+        self.last_tfi_update_ms = now_ms;
+
+        // Add signed USD notional of this trade.
+        let notional    = qty * price;
+        let signed_flow = if !is_buyer_maker { notional } else { -notional };
+        self.tfi_rolling_sum += signed_flow;
     }
 
-    /// Apply a confirmed Binance fill to inventory, PnL, and last_fill_price.
+    /// Apply a confirmed fill to inventory and PnL.
     pub fn record_real_fill(&mut self, is_buy: bool, price: f64, qty: f64, fee_usd: f64) {
         let notional = price * qty;
         if is_buy {
             self.inventory_coin += qty;
             self.pnl_usd        -= notional + fee_usd;
             self.last_fill_price = price;
-            self.ticks_held      = 0;   // fresh fill — reset stale counter
+            self.ticks_held      = 0;
         } else {
             self.inventory_coin -= qty;
             self.pnl_usd        += notional - fee_usd;
-            // Reset stale counter only when fully flat — partial tranche sells
-            // keep the timer running so remaining tranches can still stale-dump.
             if self.inventory_coin <= self.lot_step {
                 self.ticks_held = 0;
             }
@@ -275,9 +216,6 @@ impl HFTEngine {
     }
 
     /// Process one market-data tick (driven by bookTicker).
-    ///
-    /// Returns TickOutput including `is_panic` flag.  When is_panic=true the
-    /// caller must immediately dispatch OrderCmd::PanicSell to the order manager.
     pub fn tick(
         &mut self,
         best_bid: f64,
@@ -302,37 +240,37 @@ impl HFTEngine {
             0.0
         };
 
-        // ── F4: EWMA High-Frequency Variance ─────────────────────────────────
+        // ── F4: Continuous-Time EWMA Variance (Fix 2) ─────────────────────────
+        // α = 1 − exp(−dt/τ), τ = 60s → weight per tick scales with real time elapsed,
+        // not tick arrival rate. Eliminates variance distortion from irregular ticks.
         if self.last_micro_price > 0.0 {
-            let delta_p = micro_price - self.last_micro_price;
-            self.variance = (1.0 - ALPHA) * self.variance + ALPHA * delta_p * delta_p;
+            let dt_sec     = (now_ms.saturating_sub(self.last_var_update_ms)) as f64 / 1_000.0;
+            let dt_clamped = dt_sec.min(VAR_LOOKBACK_S); // cap at 60s to prevent blow-up on reconnect
+            let alpha      = 1.0 - (-dt_clamped / VAR_LOOKBACK_S).exp();
+            let delta_p    = micro_price - self.last_micro_price;
+            self.variance  = (1.0 - alpha) * self.variance + alpha * delta_p * delta_p;
             self.warm_ticks += 1;
         }
-        self.last_micro_price = micro_price;
+        self.last_micro_price  = micro_price;
+        self.last_var_update_ms = now_ms;
 
-        // ── F3: Trade-Flow Imbalance (pre-accumulated ring buffer) ────────────
-        let tfi: f64 = {
-            let mut sum = 0.0_f64;
-            let mut i   = 0_usize;
-            while i < self.tfi_len {
-                let real_idx = if self.tfi_head >= self.tfi_len {
-                    (self.tfi_head - self.tfi_len + i) % TFI_CAP
-                } else {
-                    (TFI_CAP + self.tfi_head - self.tfi_len + i) % TFI_CAP
-                };
-                if now_ms.saturating_sub(self.tfi_ts[real_idx]) <= TFI_WINDOW_MS {
-                    sum += self.tfi_sign[real_idx] as f64 * self.tfi_vols[real_idx];
-                }
-                i += 1;
-            }
-            sum
-        };
+        // ── F3: TFI (read decayed rolling sum to now) ────────────────────────
+        let dt_tfi    = (now_ms.saturating_sub(self.last_tfi_update_ms)) as f64 / 1_000.0;
+        let tfi_decay = (-dt_tfi * std::f64::consts::LN_2 / TFI_HALF_LIFE_S).exp();
+        let tfi       = self.tfi_rolling_sum * tfi_decay;
 
-        // ── F5: Reservation Price (live_gamma from Agent Q Tactical) ─────────
-        let reservation_price =
-            micro_price - (self.inventory_coin * self.live_gamma * self.variance);
+        // ── F5: Reservation Price — Spot-Symmetry Corrected (Fix 3) ──────────
+        // Neutral inventory = MAX/2 (halfway through grid capacity).
+        // inventory_risk_skew > 0 → we are over-long → reservation skews lower.
+        // inventory_risk_skew < 0 → we are under-long → reservation skews higher.
+        let neutral_inventory   = self.live_max_tranches as f64
+            * (6.00 / micro_price.max(1e-9))
+            / 2.0;
+        let inventory_risk_skew = self.inventory_coin - neutral_inventory;
+        let reservation_price   =
+            micro_price - (inventory_risk_skew * self.live_gamma * self.variance);
 
-        // ── F6: Spread (live_min_spread from Agent Q Tactical) ────────────────
+        // ── F6: Spread ────────────────────────────────────────────────────────
         let ts           = self.tick_size;
         let raw_delta    = ts + (self.live_gamma * self.variance);
         let spread_delta = raw_delta.max(ts * self.live_min_spread);
@@ -341,77 +279,63 @@ impl HFTEngine {
         let optimal_bid = snap(reservation_price - spread_delta);
         let optimal_ask = snap(reservation_price + spread_delta);
 
-        // ── Execution: Multi-Tranche Grid Math (PRD §3) ──────────────────────
+        // ── Execution: Multi-Tranche Grid (PRD §5) ───────────────────────────
         let warmed = self.warm_ticks >= 20;
 
-        // OBI momentum shield — Agent Q controls tolerance for sell pressure.
-        // safe_to_buy:  obi > -threshold  (1.0=permissive, 0.1=only buy uptrends)
-        // safe_to_sell: obi <  threshold  (always true at default 1.0)
         let safe_to_buy  = obi > -self.live_obi_threshold.abs();
         let safe_to_sell = obi <  self.live_obi_threshold.abs();
 
-        // Current inventory notional value.
         let current_notional = self.inventory_coin * micro_price;
 
         if !warmed {
-            // Gate: not enough ticks to trust variance estimate.
             self.open_bid = None;
             self.open_ask = None;
         } else if tfi.abs() > self.live_tfi_threshold {
-            // TFI Toxic Flow Shield — outermost guard, overrides everything.
+            // Toxic Flow Shield — outermost guard.
             self.open_bid = None;
             self.open_ask = None;
         } else {
             // ── Multi-Tranche Capacity Math ───────────────────────────────────
-            // Each tranche = $6.00 notional. active_tranches = floor(notional / 6).
-            // At 0 tranches (flat or dust) we can bid up to live_max_tranches.
-            // At live_max_tranches we stop bidding and only quote asks.
-            let notional_per_tranche = 6.00_f64;
-            let active_tranches = (current_notional / notional_per_tranche).floor() as u32;
+            let active_tranches = (current_notional / 6.00).floor() as u32;
 
-            // Stale inventory tracking — time held drives the profit-floor surrender.
             if active_tranches > 0 {
                 self.ticks_held += 1;
             } else {
                 self.ticks_held = 0;
             }
 
-            // ── Grid Spacing Offset (Crucial Defense) ─────────────────────────
-            // Every tranche we hold forces the NEXT bid 2 ticks lower, preventing
-            // all tranches from stacking at the exact same price and creating a
-            // millisecond allocation collapse.
-            let grid_offset = (active_tranches as f64) * (self.tick_size * 2.0);
+            // ── F7: Dynamic Grid Spacing (AI-Controlled) ──────────────────────
+            // Each tranche held steps the next bid lower by live_grid_offset_ticks.
+            // Replaces hardcoded 2.0 — Agent Q adjusts spacing to market volatility.
+            // High volatility → wider spacing to catch dip bottoms without collapse.
+            // Chop/range → tight spacing (1.0–3.0) to densely farm fees.
+            let grid_offset = (active_tranches as f64) * (ts * self.live_grid_offset_ticks);
 
-            // ── BID SIDE: open if under capacity and market is safe ────────────
+            // ── BID SIDE ──────────────────────────────────────────────────────
             if active_tranches < self.live_max_tranches && safe_to_buy {
-                let aggressive_spread  = spread_delta * 0.8;
-                let base_bid_price     = reservation_price - aggressive_spread;
-                let stepped_bid_price  = base_bid_price - grid_offset;
-                self.open_bid = Some((stepped_bid_price / self.tick_size).round() * self.tick_size);
+                let stepped_bid_price = optimal_bid - grid_offset;
+                self.open_bid = Some((stepped_bid_price / ts).round() * ts);
             } else {
-                // Max capacity reached OR OBI shield blocking — pull bids.
                 self.open_bid = None;
             }
 
-            // ── ASK SIDE: always quote when holding at least 1 tranche ────────
-            // safe_to_sell at default obi_threshold=1.0 is always true.
-            // Stale Inventory Dump: after 600 ticks (~60s) surrender the profit
-            // floor so AS math can exit at break-even and free frozen capital.
+            // ── ASK SIDE — Exit Plan & Stale Dump ────────────────────────────
             if active_tranches > 0 && safe_to_sell {
-                let stale_release    = if self.ticks_held > 600 { 0.0 } else { self.tick_size };
-                let min_profit_price = self.last_fill_price + stale_release;
+                // PRD §5: Stale Inventory Dump
+                //   Normal (≤600 ticks):  demand 1-tick profit floor
+                //   Stale  (>600 ticks):  accept break-even to regain velocity
+                let min_profit_price = if self.ticks_held > 600 {
+                    self.last_fill_price             // break-even: free frozen capital
+                } else {
+                    self.last_fill_price + ts        // iron profit floor: 1 tick
+                };
                 self.open_ask = Some(optimal_ask.max(min_profit_price));
             } else {
                 self.open_ask = None;
             }
         }
 
-        // ── Panic Stop-Loss ───────────────────────────────────────────────────
-        // ONLY fires on ToxicLiquidationCascade regime.
-        // Price-based drawdown condition removed — it bypassed the iron profit
-        // floor at a 14:1 adverse risk:reward ratio (for DOGE at $0.09, it fired
-        // 14 ticks below fill while the floor only needs 1 tick above fill).
-        // Normal exits handled by: iron profit floor + stale dump (ticks_held > 600).
+        // ── Panic Stop-Loss (ToxicLiquidationCascade only) ───────────────────
         let is_panic = self.inventory_coin > 0.0 &&
             self.current_regime == MarketRegime::ToxicLiquidationCascade;
 

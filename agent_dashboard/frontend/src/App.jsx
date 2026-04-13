@@ -210,11 +210,11 @@ function SymbolStrip({ symbol, holding, order, agentQ }) {
         </span>
       </div>
 
-      {/* Regime */}
+      {/* Regime + live params summary */}
       <div className="flex items-center gap-1">
         <Badge label={regMeta.label} color={regMeta.color} size="xs" />
         {params && <span className="text-[10px]" style={{ color: C.muted }}>
-          γ={pp(params.gamma, 2)} s={pp(params.min_spread_ticks, 1)} obi={pp(params.obi_threshold, 2)}
+          γ={pp(params.gamma, 2)} s={pp(params.min_spread_ticks, 1)} off={pp(params.grid_offset_ticks ?? 2.0, 1)}t
         </span>}
       </div>
 
@@ -313,18 +313,23 @@ function AgentQPanel({ agentQ, rewardHistory }) {
           )}
         </div>
 
-        {/* Live params */}
+        {/* Live params — 6 levers from Agent Q */}
         {params ? (
           <div className="grid grid-cols-3 gap-3">
-            <Stat label="γ (Gamma)"      value={pp(params.gamma, 3)}            color={C.blue} />
-            <Stat label="Min Spread"     value={`${pp(params.min_spread_ticks, 1)} tks`} color={C.amber} />
-            <Stat label="TFI Threshold"  value={`$${parseFloat(params.tfi_threshold ?? 0).toLocaleString()}`} color={C.purple} />
-            <Stat label="OBI Shield"     value={pp(params.obi_threshold, 2)}    color={parseFloat(params.obi_threshold ?? 1) >= 0.7 ? C.green : parseFloat(params.obi_threshold ?? 1) <= 0.3 ? C.red : C.amber} />
-            <Stat label="Max Tranches"   value={`${params.max_active_tranches ?? 1} / 10`} color={C.teal} />
-            <Stat label="Capital Depth"  value={`$${((params.max_active_tranches ?? 1) * 6).toFixed(0)}`} color={C.muted} />
+            <Stat label="γ (Gamma)"       value={pp(params.gamma, 3)}            color={C.blue} />
+            <Stat label="Min Spread"      value={`${pp(params.min_spread_ticks, 1)} tks`} color={C.amber} />
+            <Stat label="TFI Threshold"   value={`$${parseFloat(params.tfi_threshold ?? 0).toLocaleString()}`} color={C.purple} />
+            <Stat label="OBI Shield"      value={pp(params.obi_threshold, 2)}
+              color={parseFloat(params.obi_threshold ?? 1) >= 0.7 ? C.green : parseFloat(params.obi_threshold ?? 1) <= 0.3 ? C.red : C.amber} />
+            <Stat label="Max Tranches"    value={`${params.max_active_tranches ?? 1} / 10`} color={C.teal} />
+            <Stat label="Grid Offset"     value={`${pp(params.grid_offset_ticks ?? 2.0, 1)} tks`}
+              color={parseFloat(params.grid_offset_ticks ?? 2) >= 10 ? C.orange : parseFloat(params.grid_offset_ticks ?? 2) <= 2 ? C.green : C.amber} />
+            <Stat label="Capital Depth"   value={`$${((params.max_active_tranches ?? 1) * 6).toFixed(0)}`} color={C.muted} />
+            <Stat label="Cycle Cadence"   value="3-min RL" color={C.muted} />
+            <Stat label="Trip Target"     value="15 / 3min" color={C.muted} />
           </div>
         ) : (
-          <div className="text-xs" style={{ color: C.muted }}>No params published yet.</div>
+          <div className="text-xs" style={{ color: C.muted }}>No params published yet. Agent Q warming up…</div>
         )}
 
         {/* T-1 RL Memory */}
@@ -546,7 +551,13 @@ function HoldingsPanel({ holdings }) {
                   <span className="text-[10px]" style={{ color: C.muted }}>
                     σ² {h.variance?.toExponential(2) ?? '—'}
                   </span>
-                  <span className="text-[10px] font-mono" style={{ color: (h.real_pnl_usd ?? h.pnl_usd) >= 0 ? C.green : C.red }}>
+                  {/* Grid geometry row */}
+                  {h?.grid_offset_ticks != null && (
+                    <span className="text-[10px] font-mono" style={{ color: C.muted }}>
+                      grid {h.grid_offset_ticks?.toFixed(1)}t · {h.max_active_tranches ?? 1} tranches max
+                    </span>
+                  )}
+                  <span className="text-[10px] font-mono" style={{ color: (h?.real_pnl_usd ?? h?.pnl_usd) >= 0 ? C.green : C.red }}>
                     PnL {ppm(h.real_pnl_usd ?? h.pnl_usd, 4)} USD
                   </span>
                 </div>
@@ -763,7 +774,7 @@ function KpiBar({ kpis }) {
             color={(k.win_rate_pct ?? 0) >= 50 ? C.green : C.red} />
       <Stat label="Round Trips (24h)" value={`${k.round_trips ?? 0}`}
             color={C.teal} />
-      <Stat label="RL Cadence Target" value="15 / min"
+      <Stat label="RL Cadence Target" value="15 / 3min"
             color={C.muted} />
     </div>
   );
@@ -864,7 +875,7 @@ function TradeLog({ trades }) {
 // ── Reward History ────────────────────────────────────────────────────────────
 
 function RewardHistory({ data, pendingCount }) {
-  const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'TFI', 'Trips /15', 'Win%', 'Net PnL', 'AQ%', 'Score', 'Override'];
+  const RH = ['Time', 'Symbol', 'Regime', 'γ', 'Spread', 'Tranches', 'Offset', 'OBI', 'Trips /15', 'Win%', 'Net PnL', 'Score', 'Override'];
 
   return (
     <Panel
@@ -901,13 +912,14 @@ function RewardHistory({ data, pendingCount }) {
               </tr>
             ) : (
               data.map((r) => {
-                const score   = parseFloat(r.reward_score ?? 0);
-                const pnl     = parseFloat(r.net_pnl      ?? 0);
-                const aq      = parseFloat(r.adverse_selection ?? 0);
-                const trips   = r.total_round_trips ?? 0;
-                const wr      = parseFloat(r.win_rate_pct ?? 0);
-                const regMeta = REGIME_META[r.regime] ?? REGIME_META.UNKNOWN;
-                // All rows from backend are guaranteed evaluated (WHERE evaluated_at IS NOT NULL)
+                const score    = parseFloat(r.reward_score       ?? 0);
+                const pnl      = parseFloat(r.net_pnl            ?? 0);
+                const trips    = r.total_round_trips              ?? 0;
+                const wr       = parseFloat(r.win_rate_pct       ?? 0);
+                const tranches = r.max_active_tranches            ?? 1;
+                const offset   = parseFloat(r.grid_offset_ticks  ?? 2.0);
+                const obi      = parseFloat(r.obi_threshold       ?? 1.0);
+                const regMeta  = REGIME_META[r.regime] ?? REGIME_META.UNKNOWN;
                 return (
                   <tr key={r.id} className="border-b" style={{ borderColor: C.border }}>
                     <td className="px-3 py-2 text-xs font-mono whitespace-nowrap" style={{ color: C.muted }}>
@@ -925,12 +937,21 @@ function RewardHistory({ data, pendingCount }) {
                     <td className="px-3 py-2 text-xs font-mono" style={{ color: C.text }}>
                       {pp(r.proposed_min_spread, 1)}
                     </td>
-                    <td className="px-3 py-2 text-xs font-mono" style={{ color: C.text }}>
-                      {parseFloat(r.tfi_threshold ?? 0).toLocaleString()}
+                    <td className="px-3 py-2 text-xs font-mono font-bold"
+                      style={{ color: tranches >= 5 ? C.green : tranches >= 3 ? C.amber : C.muted }}>
+                      {tranches}
+                    </td>
+                    <td className="px-3 py-2 text-xs font-mono"
+                      style={{ color: offset >= 10 ? C.orange : offset <= 2 ? C.green : C.amber }}>
+                      {pp(offset, 1)}t
+                    </td>
+                    <td className="px-3 py-2 text-xs font-mono"
+                      style={{ color: obi >= 0.7 ? C.green : obi <= 0.3 ? C.red : C.amber }}>
+                      {pp(obi, 2)}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
                       style={{ color: trips >= 15 ? C.green : trips > 0 ? C.amber : C.red }}>
-                      {trips}
+                      {trips}<span className="text-[9px] font-normal" style={{ color: C.muted }}>/15</span>
                     </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
                       style={{ color: wr >= 50 ? C.green : C.amber }}>
@@ -940,17 +961,13 @@ function RewardHistory({ data, pendingCount }) {
                       style={{ color: pnl >= 0 ? C.green : C.red }}>
                       {ppm(pnl, 4)}
                     </td>
-                    <td className="px-3 py-2 text-xs font-mono"
-                      style={{ color: aq > 60 ? C.red : aq > 40 ? C.amber : C.green }}>
-                      {`${pp(aq, 1)}%`}
-                    </td>
                     <td className="px-3 py-2 text-xs font-mono font-bold"
-                      style={{ color: score >= 0 ? C.green : C.red }}>
+                      style={{ color: score >= 50 ? C.green : score >= 0 ? C.teal : score > -100 ? C.amber : C.red }}>
                       {ppm(score, 1)}
                     </td>
                     <td className="px-3 py-2">
                       {r.override_applied
-                        ? <Badge label="OVERRIDDEN" color={C.amber} size="xs" />
+                        ? <Badge label="CRO OVERRIDE" color={C.amber} size="xs" />
                         : <span className="text-[10px]" style={{ color: C.muted }}>—</span>}
                     </td>
                   </tr>
@@ -1064,12 +1081,12 @@ export default function App() {
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-lg font-black tracking-[0.2em] uppercase" style={{ color: C.amber }}>
-              PROJECT MAMMON V2
+              PROJECT MAMMON V2.2
             </h1>
-            <Badge label="SELF-HEALING AGENTIC HFT" color={C.amber} size="xs" />
+            <Badge label="HYPER-CADENCE DYNAMIC GRID HFT" color={C.amber} size="xs" />
           </div>
           <p className="text-[10px] mt-0.5" style={{ color: C.muted }}>
-            Avellaneda-Stoikov · Multi-Tranche Grid ($6/tranche, up to 10) · RAG Memory · Agent Q
+            Avellaneda-Stoikov · Dynamic Grid (AI offset, $6/tranche, up to 10) · 3-min RL Cycle · Agent Q V2.2
           </p>
         </div>
 

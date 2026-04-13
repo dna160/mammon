@@ -37,20 +37,22 @@ use tracing::{error, info, warn};
 
 // ── Agent Q message types ─────────────────────────────────────────────────────
 
-/// Tactical parameters injected every 1 minute by the Parameter Tuner.
+/// Tactical parameters injected every 3 minutes by the Parameter Tuner (V2.2).
 #[derive(Debug, Deserialize)]
 struct AgentQParams {
     gamma:            f64,
     min_spread_ticks: f64,
     tfi_threshold:    f64,
     /// OBI momentum shield [0.0–1.0]. 1.0 = permissive (any OBI), 0.1 = uptrends only.
-    /// Optional — older payloads without this field default to 1.0 (fully permissive).
     #[serde(default)]
     obi_threshold:       Option<f64>,
     /// Max concurrent $6 tranches [1–10]. Default 1 (strict ping-pong).
-    /// Agent Q scales up during safe regimes to increase fill cadence.
     #[serde(default)]
     max_active_tranches: Option<u32>,
+    /// AI-controlled grid spacing in ticks [1.0–50.0]. Default 2.0.
+    /// Controls step size between consecutive tranche bids.
+    #[serde(default)]
+    grid_offset_ticks:   Option<f64>,
     #[allow(dead_code)]
     system_status:    Option<String>,
 }
@@ -86,12 +88,12 @@ type AgentQUpdate = (String, AgentQMessage);
 // ── Coin configuration table ──────────────────────────────────────────────────
 
 struct CoinConfig {
-    symbol:        &'static str,  // "BTCFDUSD"
-    stream_prefix: &'static str,  // "btcfdusd"
+    symbol:        &'static str,  // "SOLFDUSD"
+    stream_prefix: &'static str,  // "solfdusd"
     tick_size:     f64,
     lot_step:      f64,
     max_inventory: f64,
-    coin_asset:    &'static str,  // "BTC", "ADA", …
+    coin_asset:    &'static str,  // "SOL", "XRP", …
 }
 
 const COIN_CONFIGS: &[CoinConfig] = &[
@@ -101,6 +103,32 @@ const COIN_CONFIGS: &[CoinConfig] = &[
     CoinConfig { symbol: "ETHFDUSD",  stream_prefix: "ethfdusd",  tick_size: 0.01,    lot_step: 0.001, max_inventory: 0.05,   coin_asset: "ETH"  },
     CoinConfig { symbol: "BNBFDUSD",  stream_prefix: "bnbfdusd",  tick_size: 0.1,     lot_step: 0.01,  max_inventory: 0.5,    coin_asset: "BNB"  },
 ];
+
+/// Pre-allocated Redis keys for each coin — eliminates format! allocations from
+/// the hot execution path (V2.2 Fix 4: Heap Allocation Fix).
+struct CoinKeys {
+    pipeline:  String,   // engine_d:{SYM}:pipeline
+    telemetry: String,   // telemetry:engine_d:{SYM}
+    orders:    String,   // engine_d:{SYM}:orders
+    last_fill: String,   // engine_d:{SYM}:last_fill
+    ticker:    String,   // toko:{sym}:ticker  (lowercase stream prefix)
+    lob:       String,   // toko:{sym}:lob
+}
+
+fn build_coin_keys() -> HashMap<String, CoinKeys> {
+    COIN_CONFIGS.iter().map(|cfg| {
+        let sym = cfg.symbol;
+        let pfx = cfg.stream_prefix;
+        (sym.to_string(), CoinKeys {
+            pipeline:  format!("engine_d:{}:pipeline",    sym),
+            telemetry: format!("telemetry:engine_d:{}",   sym),
+            orders:    format!("engine_d:{}:orders",      sym),
+            last_fill: format!("engine_d:{}:last_fill",   sym),
+            ticker:    format!("toko:{}:ticker",          pfx),
+            lob:       format!("toko:{}:lob",             pfx),
+        })
+    }).collect()
+}
 
 // ── WebSocket URL builder ─────────────────────────────────────────────────────
 
@@ -187,9 +215,12 @@ const BALANCE_REFRESH_S: u64 = 30;
 /// with what it has (capped at TARGET) rather than sitting completely idle.
 const MIN_BID_FDUSD: f64 = binance_rest::MIN_NOTIONAL + 0.10;
 
+/// Queue stabilization: only requote if price moved by ≥ 1.5 × tick_size.
+/// Prevents flickering / cancel-replace storms from micro-movements.
+/// PRD §5.1: reduces wasted API weight and queue position disruption.
 fn moved_enough(new_price: f64, old_price: f64, tick_size: f64) -> bool {
     if old_price == 0.0 { return true; }
-    (new_price - old_price).abs() >= tick_size
+    (new_price - old_price).abs() >= tick_size * 1.5
 }
 
 // ── Order manager task ────────────────────────────────────────────────────────
@@ -821,6 +852,9 @@ async fn stream_loop(
         .map(|cfg| (cfg.symbol.to_string(), cfg))
         .collect();
 
+    // Pre-allocated Redis keys — eliminates format! heap allocations from hot path.
+    let coin_keys: HashMap<String, CoinKeys> = build_coin_keys();
+
     // Per-coin tick counters.
     let mut tick_book:     HashMap<String, u64> = COIN_CONFIGS.iter().map(|c| (c.symbol.to_string(), 0u64)).collect();
     let mut tick_aggtrade: HashMap<String, u64> = COIN_CONFIGS.iter().map(|c| (c.symbol.to_string(), 0u64)).collect();
@@ -952,12 +986,13 @@ async fn stream_loop(
                     if let Some(eng) = engines.get_mut(&sym) {
                         match msg {
                             AgentQMessage::Params(p) => {
-                                let obi       = p.obi_threshold.unwrap_or(1.0);
-                                let tranches  = p.max_active_tranches.unwrap_or(1);
-                                eng.update_params(p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, tranches);
+                                let obi      = p.obi_threshold.unwrap_or(1.0);
+                                let tranches = p.max_active_tranches.unwrap_or(1);
+                                let offset   = p.grid_offset_ticks.unwrap_or(2.0);
+                                eng.update_params(p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, tranches, offset);
                                 info!(
-                                    "[{}][AgentQ-Tactical] γ={:.2} spread={:.1} tfi={:.0} obi={:.2} tranches={} status={:?}",
-                                    sym, p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, tranches, p.system_status
+                                    "[{}][AgentQ-Tactical] γ={:.2} spread={:.1} tfi={:.0} obi={:.2} tranches={} offset={:.1} status={:?}",
+                                    sym, p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, tranches, offset, p.system_status
                                 );
                             }
                             AgentQMessage::Regime(r) => {
@@ -1024,7 +1059,7 @@ async fn stream_loop(
                 }
 
                 let pp = format!(
-                    r#"{{"ts":{},"symbol":"{}","tick":{},"tick_us":{},"warm_ticks":{},"micro_price":{:.8},"lob_bid":{:.8},"lob_ask":{:.8},"obi":{:.6},"tfi":{:.6},"variance":{:.10},"reservation":{:.8},"optimal_bid":{:.8},"optimal_ask":{:.8},"spread":{:.8},"open_bid":{},"open_ask":{},"inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"decision":"{}"}}"#,
+                    r#"{{"ts":{},"symbol":"{}","tick":{},"tick_us":{},"warm_ticks":{},"micro_price":{:.8},"lob_bid":{:.8},"lob_ask":{:.8},"obi":{:.6},"tfi":{:.6},"variance":{:.10},"reservation":{:.8},"optimal_bid":{:.8},"optimal_ask":{:.8},"spread":{:.8},"open_bid":{},"open_ask":{},"inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"decision":"{}","grid_offset_ticks":{:.2},"max_active_tranches":{}}}"#,
                     now_ms, symbol, tb, tick_us, out.warm_ticks,
                     out.micro_price, bid, ask,
                     out.obi, out.tfi, out.variance,
@@ -1033,9 +1068,10 @@ async fn stream_loop(
                     out.open_bid.map(|v| format!("{:.8}", v)).unwrap_or_else(|| "null".into()),
                     out.open_ask.map(|v| format!("{:.8}", v)).unwrap_or_else(|| "null".into()),
                     out.inventory_coin, out.pnl_usd, out.total_trades, decision,
+                    engine.live_grid_offset_ticks, engine.live_max_tranches,
                 );
-                let pipeline_key = format!("engine_d:{}:pipeline", symbol);
-                let _ = con.set::<_, _, ()>(&pipeline_key, &pp).await;
+                // Use pre-allocated key (Fix 4: no format! in hot path)
+                let _ = con.set::<_, _, ()>(&coin_keys[&symbol].pipeline, &pp).await;
 
                 // ── Order dispatch (warmed-up only) ───────────────────────────
                 if out.warm_ticks >= 20 {
@@ -1099,9 +1135,8 @@ async fn stream_loop(
                         r#"{{"ts":{},"symbol":"{}","inventory_coin":{:.8},"pnl_usd":{:.4},"total_trades":{},"variance":{:.10},"tfi":{:.4},"ticks_book":{},"ticks_agg":{}}}"#,
                         ts, sym, inv, pnl, trades, var, tfi, tb_v, ta_v
                     );
-                    let key = format!("telemetry:engine_d:{}", sym);
+                    let key2 = coin_keys[sym].telemetry.clone();
                     let mut c2 = tel_con.clone();
-                    let key2 = key.clone();
                     tokio::spawn(async move {
                         if let Err(e) = c2.set::<_, _, ()>(&key2, &payload).await {
                             warn!("[{}] telemetry write failed: {}", sym, e);
