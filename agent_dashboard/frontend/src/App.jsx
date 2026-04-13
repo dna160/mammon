@@ -558,9 +558,9 @@ function HoldingsPanel({ holdings, onResetPnl }) {
           onClick={onResetPnl}
           className="text-[10px] font-mono px-2 py-0.5 rounded transition-opacity hover:opacity-80"
           style={{ background: `${C.amber}22`, color: C.amber, border: `1px solid ${C.amber}44` }}
-          title="Zero all PnL baselines (mark current MTM as break-even)"
+          title="Snapshot current FDUSD equity as the zero-point. PnL = equity now − equity at reset."
         >
-          Reset PnL
+          ⚡ Reset Baseline
         </button>
       }
     >
@@ -847,34 +847,44 @@ function PnlChart({ chart }) {
 
 // ── KPI Bar ───────────────────────────────────────────────────────────────────
 
-function KpiBar({ kpis, holdings, cadence }) {
+function KpiBar({ kpis, holdings, cadence, equityPnl, equityNow, startingFdusd, fdusdBalance }) {
   const k = kpis ?? {};
 
-  // Total live MTM PnL across all coins (baseline-adjusted)
-  const totalMtm = Object.values(holdings ?? {}).reduce((s, h) => s + (h?.pnl_mtm ?? 0), 0);
-
   // Total live trips across all coins in the current 3-min window
-  const totalTrips3min = Object.values(cadence ?? {}).reduce((s, c) => s + (c?.trips_3min ?? 0), 0);
-  const totalTarget3min = Object.keys(cadence ?? {}).length * 15; // 15 per coin
+  const totalTrips3min  = Object.values(cadence ?? {}).reduce((s, c) => s + (c?.trips_3min ?? 0), 0);
+  const totalTarget3min = Object.keys(cadence ?? {}).length * 15;
+
+  // Equity PnL is the primary metric: current_equity − starting_FDUSD
+  const hasEquity    = equityPnl != null;
+  const equityColor  = !hasEquity ? C.muted : equityPnl >= 0 ? C.green : C.red;
 
   return (
     <div
       className="flex flex-wrap gap-6 px-6 py-3 border-b"
       style={{ background: C.surface2, borderColor: C.border }}
     >
+      {/* Primary: FDUSD equity PnL — the real money number */}
+      <Stat
+        label={startingFdusd != null ? `PnL vs Start ($${parseFloat(startingFdusd).toFixed(2)} FDUSD)` : 'Session PnL'}
+        value={hasEquity ? `${ppm(equityPnl, 4)} USD` : '— (reset to start)'}
+        color={equityColor}
+      />
+      <Stat
+        label="FDUSD Balance"
+        value={fdusdBalance != null ? `$${parseFloat(fdusdBalance).toFixed(2)}` : '—'}
+        color={C.teal}
+      />
+      <Stat
+        label="Total Equity Now"
+        value={equityNow != null ? `$${parseFloat(equityNow).toFixed(2)}` : '—'}
+        color={C.blue}
+      />
       <Stat label="Trades (24h)"      value={k.daily_trades ?? '—'} />
       <Stat label="Realised PnL (24h)"
             value={`${ppm(k.total_net_pnl, 4)} USD`}
             color={(k.total_net_pnl ?? 0) >= 0 ? C.green : C.red} />
-      <Stat label="Live MTM PnL"
-            value={`${ppm(totalMtm, 4)} USD`}
-            color={totalMtm >= 0 ? C.green : C.red} />
-      <Stat label="Avg PnL / Trade"   value={`${ppm(k.avg_pnl_per_trade, 4)} USD`}
-            color={(k.avg_pnl_per_trade ?? 0) >= 0 ? C.green : C.red} />
       <Stat label="Win Rate (24h)"    value={`${pp(k.win_rate_pct, 1)}%`}
             color={(k.win_rate_pct ?? 0) >= 50 ? C.green : C.red} />
-      <Stat label="Round Trips (24h)" value={`${k.round_trips ?? 0}`}
-            color={C.teal} />
       <Stat label="Live Trips / 3min (all)"
             value={`${totalTrips3min} / ${totalTarget3min}`}
             color={totalTrips3min >= totalTarget3min ? C.green : totalTrips3min >= totalTarget3min * 0.5 ? C.amber : C.red} />
@@ -1241,7 +1251,15 @@ export default function App() {
       </div>
 
       {/* ── KPI Bar ── */}
-      <KpiBar kpis={d.kpis} holdings={d.holdings} cadence={cadence} />
+      <KpiBar
+        kpis={d.kpis}
+        holdings={d.holdings}
+        cadence={cadence}
+        equityPnl={d.equity_pnl}
+        equityNow={d.equity_now}
+        startingFdusd={d.starting_fdusd}
+        fdusdBalance={d.fdusd_balance}
+      />
 
       {/* ── Symbol Strips ── */}
       <div className="shrink-0 border-b" style={{ borderColor: C.border }}>

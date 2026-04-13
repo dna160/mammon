@@ -389,7 +389,7 @@ async function getRewardHistory(limit = 50) {
 }
 
 async function getFullSnapshot() {
-  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory, cadence] = await Promise.all([
+  const [holdings, orders, lastFills, agentQ, kpis, trades, chart, rewardHistory, cadence, fdusdBal] = await Promise.all([
     getHoldings(),
     getOrders(),
     getLastFills(),
@@ -399,9 +399,28 @@ async function getFullSnapshot() {
     getChart(),
     getRewardHistory(50),
     getLiveCadence(),
+    getFdusdBalances(),
   ]);
 
-  // Compute per-symbol cumulative PnL from holdings (MTM — mark-to-market)
+  // ── Equity PnL (FDUSD-based — the real number) ───────────────────────────────
+  // equity = FDUSD_balance + sum(coin_qty × micro_price)
+  // PnL    = equity_now − equity_at_reset (stored in dashboard:equity_baseline)
+  const equityNow = await getTotalEquity(holdings, fdusdBal);
+
+  let equityBaseline  = null;
+  let equityPnl       = null;
+  let startingFdusd   = null;
+  try {
+    const raw = await redis.get('dashboard:equity_baseline');
+    if (raw) {
+      const b         = JSON.parse(raw);
+      equityBaseline  = parseFloat(b.equity ?? 0);
+      startingFdusd   = parseFloat(b.fdusd  ?? 0);
+      equityPnl       = equityNow !== null ? equityNow - equityBaseline : null;
+    }
+  } catch (_) {}
+
+  // Per-symbol MTM PnL (coin-level view, already computed in holdings)
   const livePnl = {};
   SYMBOLS.forEach((sym) => {
     if (holdings[sym]) livePnl[sym] = holdings[sym].pnl_mtm;
@@ -421,6 +440,13 @@ async function getFullSnapshot() {
     reward_history:        rewardHistory.rows,
     reward_pending_count:  rewardHistory.pending_count,
     cadence,
+    // Real FDUSD equity tracking
+    fdusd_balance:         fdusdBal?.fdusd ?? null,
+    fdusd_coins:           fdusdBal?.coins ?? null,
+    equity_now:            equityNow,
+    equity_baseline:       equityBaseline,
+    starting_fdusd:        startingFdusd,
+    equity_pnl:            equityPnl,
   };
 }
 
@@ -494,24 +520,78 @@ app.get('/api/cadence', async (_req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/reset-pnl  — zeroes the PnL baseline for all (or one) symbol.
-// Body (optional): { symbol: "ETHFDUSD" }  — omit to reset all.
+// ── FDUSD live balance reader ─────────────────────────────────────────────────
+// Reads engine_d:balances (published by Rust every 30s) and returns:
+//   { fdusd, coins: { SOL: qty, XRP: qty, ... }, ts }
+// Falls back to null if key is stale/missing.
+async function getFdusdBalances() {
+  try {
+    const raw = await redis.get('engine_d:balances');
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    const fdusd = parseFloat(d.FDUSD ?? 0);
+    const coins = {};
+    for (const sym of SYMBOLS) {
+      const asset = sym.replace('FDUSD', '');
+      coins[asset] = parseFloat(d[asset] ?? 0);
+    }
+    return { fdusd, coins, ts: d.ts ?? null };
+  } catch (_) { return null; }
+}
+
+// Compute total account equity: FDUSD cash + value of all open coin positions.
+// Uses micro_price from pipeline for each coin (most up-to-date mid-price).
+async function getTotalEquity(holdings, fdusdBalances) {
+  if (!fdusdBalances) return null;
+  let equity = fdusdBalances.fdusd;
+  for (const sym of SYMBOLS) {
+    const h     = holdings?.[sym];
+    const asset = sym.replace('FDUSD', '');
+    const coinQty   = fdusdBalances.coins[asset] ?? 0;
+    const midPrice  = h?.micro_price ?? 0;
+    equity += coinQty * midPrice;
+  }
+  return equity;
+}
+
+// POST /api/reset-pnl  — snapshot current FDUSD equity as the zero-point baseline.
+// All fields are zeroed visually; PnL = equity_now − equity_at_reset.
 app.post('/api/reset-pnl', async (req, res) => {
   try {
-    const { symbol } = req.body ?? {};
-    const targets = symbol ? [symbol] : SYMBOLS;
-    const h = await getHoldings();
-    await Promise.all(
-      targets.map(async (sym) => {
+    const [h, fdusdBal] = await Promise.all([getHoldings(), getFdusdBalances()]);
+
+    const equity = await getTotalEquity(h, fdusdBal);
+    if (equity === null) {
+      // Fallback: if engine_d:balances not yet populated, use old MTM method
+      const targets = SYMBOLS;
+      await Promise.all(targets.map(async (sym) => {
         const hd = h[sym];
         if (!hd) return;
-        // Baseline = current MTM so display starts at 0
-        const baseline = hd.pnl_mtm + (hd.pnl_baseline ?? 0); // remove old baseline first
+        const baseline = hd.pnl_mtm + (hd.pnl_baseline ?? 0);
         await redis.set(`dashboard:pnl_baseline:${sym}`, baseline.toFixed(8));
-      })
-    );
-    console.log(`[PnL Reset] Zeroed: ${targets.join(', ')}`);
-    res.json({ ok: true, reset: targets });
+      }));
+      console.log('[PnL Reset] Fallback MTM reset (engine_d:balances not available)');
+      return res.json({ ok: true, method: 'mtm_fallback' });
+    }
+
+    // Store the equity snapshot as the global starting point.
+    const ts = Date.now();
+    await redis.set('dashboard:equity_baseline', JSON.stringify({
+      equity:  equity.toFixed(8),
+      fdusd:   (fdusdBal?.fdusd ?? 0).toFixed(4),
+      ts,
+    }));
+
+    // Also zero per-symbol MTM baselines so coin strips show 0.
+    await Promise.all(SYMBOLS.map(async (sym) => {
+      const hd = h[sym];
+      if (!hd) return;
+      const mtm = hd.pnl_mtm + (hd.pnl_baseline ?? 0);
+      await redis.set(`dashboard:pnl_baseline:${sym}`, mtm.toFixed(8));
+    }));
+
+    console.log(`[PnL Reset] Equity baseline = $${equity.toFixed(4)} FDUSD (at ${new Date(ts).toISOString()})`);
+    res.json({ ok: true, starting_equity: equity, fdusd: fdusdBal?.fdusd, ts });
   } catch (e) {
     console.error('[PnL Reset] error:', e.message);
     res.status(500).json({ error: e.message });

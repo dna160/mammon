@@ -339,7 +339,8 @@ async fn order_manager(
     // free+locked ground truth to survive container restarts (Inventory Amnesia fix).
     match client.get_balances().await {
         Ok(b) => {
-            info!("[OrderMgr] Initial balances: FDUSD={:.2}", b.get("FDUSD").copied().unwrap_or(0.0));
+            let fdusd_init = b.get("FDUSD").copied().unwrap_or(0.0);
+            info!("[OrderMgr] Initial balances: FDUSD={:.2}", fdusd_init);
             for cfg in COIN_CONFIGS {
                 let total = b.get(cfg.coin_asset).copied().unwrap_or(0.0);
                 info!("  {} total(free+locked)={:.8}", cfg.coin_asset, total);
@@ -353,6 +354,8 @@ async fn order_manager(
                     }
                 }
             }
+            // Publish FDUSD + all coin balances to Redis so dashboard can compute real equity PnL.
+            publish_balances_to_redis(&mut redis_con, &b).await;
             balances = b;
             last_bal_refresh = Instant::now();
         }
@@ -397,6 +400,8 @@ async fn order_manager(
                             }
                         }
                     }
+                    // Publish updated balances to Redis for dashboard equity PnL.
+                    publish_balances_to_redis(&mut redis_con, &b).await;
                     balances = b;
                     last_bal_refresh = Instant::now();
                 }
@@ -793,6 +798,31 @@ fn lob_json(symbol: &str, bids: &[(f64, f64)], asks: &[(f64, f64)]) -> String {
     };
     format!(r#"{{"ts":{},"symbol":"{}","bids":[{}],"asks":[{}]}}"#,
         micros_now(), symbol, fmt(bids), fmt(asks))
+}
+
+/// Publish live FDUSD + all coin balances to Redis so the dashboard can compute
+/// real equity PnL: equity = FDUSD + sum(coin_qty × micro_price).
+/// Key: engine_d:balances  TTL: 120s (stale if engine dies).
+async fn publish_balances_to_redis(
+    con:      &mut redis::aio::MultiplexedConnection,
+    balances: &std::collections::HashMap<String, f64>,
+) {
+    let fdusd = balances.get("FDUSD").copied().unwrap_or(0.0);
+    // Build a JSON object with FDUSD + every tracked coin asset.
+    let coins: String = COIN_CONFIGS.iter().map(|cfg| {
+        let qty = balances.get(cfg.coin_asset).copied().unwrap_or(0.0);
+        format!(r#""{}": {:.8}"#, cfg.coin_asset, qty)
+    }).collect::<Vec<_>>().join(", ");
+
+    let ts  = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let payload = format!(r#"{{"ts": {}, "FDUSD": {:.4}, {}}}"#, ts, fdusd, coins);
+
+    if let Err(e) = con.set_ex::<_, _, ()>("engine_d:balances", payload, 120).await {
+        warn!("[Balances] Redis publish failed: {}", e);
+    }
 }
 
 async fn redis_set(con: &mut redis::aio::MultiplexedConnection, key: &str, value: &str) {
