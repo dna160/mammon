@@ -14,11 +14,15 @@
 //!                       P*_bid = snap(r − δ, tick_size)
 //!                       P*_ask = snap(r + δ, tick_size)
 //!
-//! State machine (shadow check is FIRST — overrides everything):
-//!   |TFI| > TFI_SHADOW_THRESHOLD     → shadow mode (pull all quotes)
-//!   inventory ≥  max_inventory_coin  → open_bid = None  (long clamped, dump)
-//!   inventory ≤ −max_inventory_coin  → open_ask = None  (short clamped, cover)
-//!   else                             → symmetric AS quotes both sides
+//! State machine (TFI shield is FIRST — overrides everything):
+//!   !warmed                          → no quotes (variance not trusted yet)
+//!   |TFI| > live_tfi_threshold       → shadow mode (pull all quotes)
+//!   else multi-tranche capacity math:
+//!     active_tranches = floor(inventory_notional / $6)
+//!     bid: if active_tranches < live_max_tranches && safe_to_buy
+//!          → grid-stepped bid (base_bid - active_tranches × 2 ticks)
+//!     ask: if active_tranches > 0 && safe_to_sell
+//!          → optimal_ask.max(last_fill + 1 tick) [or break-even if stale > 600]
 //!
 //! Panic stop-loss:
 //!   inventory > 0 AND micro_price < last_fill_price * 0.9985
@@ -35,6 +39,8 @@ const DEFAULT_LIVE_MIN_SPREAD:     f64 = 5.0;
 const DEFAULT_LIVE_TFI_THRESHOLD:  f64 = 65_000.0; // USD notional — safe default until Agent Q sets it
 /// OBI momentum shield — 1.0 = fully permissive (buy in any OBI). Agent Q tightens downward.
 const DEFAULT_LIVE_OBI_THRESHOLD:  f64 = 1.0;
+/// Max concurrent $6 tranches — default 1 (strict ping-pong). Agent Q scales up to 10 in safe regimes.
+const DEFAULT_LIVE_MAX_TRANCHES:   u32 = 1;
 
 /// Mirror of binance_rest::MIN_NOTIONAL — minimum FDUSD to place/hold a sell order.
 /// Kept in sync manually; engine uses it to detect dust traps without cross-module dep.
@@ -125,6 +131,10 @@ pub struct HFTEngine {
     /// safe_to_buy  = obi > -live_obi_threshold  (1.0 = permissive, 0.1 = conservative)
     /// safe_to_sell = obi <  live_obi_threshold
     pub live_obi_threshold:  f64,
+    /// Max concurrent tranches Agent Q allows (1–10). Each tranche ≈ $6.00 notional.
+    /// At 1 = strict ping-pong. At 10 = full grid depth using $60+ capital.
+    /// Defaults to 1; Agent Q scales up during safe regimes to hit cadence quota.
+    pub live_max_tranches:   u32,
 
     // ── Engine state ──────────────────────────────────────────────────────────
     /// Net coin inventory.  Positive = long, negative = short.
@@ -190,6 +200,7 @@ impl HFTEngine {
             live_min_spread:    DEFAULT_LIVE_MIN_SPREAD,
             live_tfi_threshold: DEFAULT_LIVE_TFI_THRESHOLD,
             live_obi_threshold: DEFAULT_LIVE_OBI_THRESHOLD,
+            live_max_tranches:  DEFAULT_LIVE_MAX_TRANCHES,
             inventory_coin:   0.0,
             variance:         0.0,
             last_micro_price: 0.0,
@@ -211,11 +222,12 @@ impl HFTEngine {
     /// Apply Agent Q Tactical parameters (every 1m) injected via Redis.
     ///
     /// Called from the main thread between ticks — no locking needed.
-    pub fn update_params(&mut self, gamma: f64, min_spread: f64, tfi_threshold: f64, obi_threshold: f64) {
+    pub fn update_params(&mut self, gamma: f64, min_spread: f64, tfi_threshold: f64, obi_threshold: f64, max_tranches: u32) {
         self.live_gamma         = gamma.clamp(0.1, 1.0);
         self.live_min_spread    = min_spread.clamp(5.0, 50.0);
         self.live_tfi_threshold = tfi_threshold.clamp(200.0, 150_000.0); // USD notional bounds
         self.live_obi_threshold = obi_threshold.clamp(0.0, 1.0);         // OBI shield [0=conservative, 1=permissive]
+        self.live_max_tranches  = max_tranches.clamp(1, 10);              // Grid depth [1=ping-pong, 10=full grid]
     }
 
     /// Apply Agent Q Oracle regime (every 5m) injected via Redis.
@@ -253,7 +265,11 @@ impl HFTEngine {
         } else {
             self.inventory_coin -= qty;
             self.pnl_usd        += notional - fee_usd;
-            self.ticks_held      = 0;   // sold — back to flat, reset counter
+            // Reset stale counter only when fully flat — partial tranche sells
+            // keep the timer running so remaining tranches can still stale-dump.
+            if self.inventory_coin <= self.lot_step {
+                self.ticks_held = 0;
+            }
         }
         self.total_trades += 1;
     }
@@ -325,7 +341,7 @@ impl HFTEngine {
         let optimal_bid = snap(reservation_price - spread_delta);
         let optimal_ask = snap(reservation_price + spread_delta);
 
-        // ── Execution: TFI Shield → Dust Recovery → Strict Ping-Pong ────────
+        // ── Execution: Multi-Tranche Grid Math (PRD §3) ──────────────────────
         let warmed = self.warm_ticks >= 20;
 
         // OBI momentum shield — Agent Q controls tolerance for sell pressure.
@@ -334,7 +350,7 @@ impl HFTEngine {
         let safe_to_buy  = obi > -self.live_obi_threshold.abs();
         let safe_to_sell = obi <  self.live_obi_threshold.abs();
 
-        // Current inventory notional value — used for MIN_NOTIONAL dust check.
+        // Current inventory notional value.
         let current_notional = self.inventory_coin * micro_price;
 
         if !warmed {
@@ -345,55 +361,49 @@ impl HFTEngine {
             // TFI Toxic Flow Shield — outermost guard, overrides everything.
             self.open_bid = None;
             self.open_ask = None;
-        } else if self.inventory_coin > 0.0 && current_notional < MIN_NOTIONAL_USD {
-            // ── DUST TRAP RECOVERY MODE ───────────────────────────────────────
-            // We hold a partial fill below Binance's $5.00 MIN_NOTIONAL.
-            // Selling is mathematically forbidden — we MUST accumulate more to
-            // push over the $5.10 threshold before attempting an Ask.
-            self.ticks_held += 1; // still holding, count time
-            if safe_to_buy {
-                // Bid aggressively at best_bid to fill fast.
-                self.open_bid = Some(best_bid);
-            } else {
-                // OBI shield: market is dumping too hard — wait, don't compound.
-                self.open_bid = None;
-            }
-            self.open_ask = None;
-        } else if self.inventory_coin >= self.lot_step {
-            // STRICT EXIT MODE: we hold ≥1 lot and notional ≥ $5.00 — only sell.
-            // Prevents multi-tranche accumulation and inventory amnesia loops.
-
-            // ── Stale Inventory Dump (PRD §5) ────────────────────────────────
-            // Track ticks held. If > 600 (~60 seconds of order book activity),
-            // surrender the profit floor so AS math can dump at break-even or
-            // micro-loss to instantly free frozen capital for the next cycle.
-            self.ticks_held += 1;
-            let min_profit_price = if self.ticks_held > 600 {
-                0.0  // Surrender floor — accept break-even / micro-loss for velocity
-            } else {
-                self.last_fill_price + self.tick_size  // Target 1-tick pure profit
-            };
-            self.open_bid = None;
-            // OBI gate on sells: skip if extreme buy pressure (OBI too high).
-            // At default obi_threshold=1.0 this is always true (safe_to_sell = obi < 1.0).
-            self.open_ask = if safe_to_sell {
-                Some(optimal_ask.max(min_profit_price))
-            } else {
-                Some(optimal_ask.max(min_profit_price)) // Always exit — sell regardless of OBI
-            };
         } else {
-            // FLAT — reset stale inventory counter, enter acquisition mode.
-            self.ticks_held = 0;
-            // STRICT ACQUISITION MODE: we are flat — only buy, never sell.
-            let aggressive_spread = spread_delta * 0.8; // 20% tighter to ensure fill
-            let bid_price = reservation_price - aggressive_spread;
-            if safe_to_buy {
-                self.open_bid = Some((bid_price / self.tick_size).round() * self.tick_size);
+            // ── Multi-Tranche Capacity Math ───────────────────────────────────
+            // Each tranche = $6.00 notional. active_tranches = floor(notional / 6).
+            // At 0 tranches (flat or dust) we can bid up to live_max_tranches.
+            // At live_max_tranches we stop bidding and only quote asks.
+            let notional_per_tranche = 6.00_f64;
+            let active_tranches = (current_notional / notional_per_tranche).floor() as u32;
+
+            // Stale inventory tracking — time held drives the profit-floor surrender.
+            if active_tranches > 0 {
+                self.ticks_held += 1;
             } else {
-                // Agent Q momentum shield: OBI too negative — pulling bids.
+                self.ticks_held = 0;
+            }
+
+            // ── Grid Spacing Offset (Crucial Defense) ─────────────────────────
+            // Every tranche we hold forces the NEXT bid 2 ticks lower, preventing
+            // all tranches from stacking at the exact same price and creating a
+            // millisecond allocation collapse.
+            let grid_offset = (active_tranches as f64) * (self.tick_size * 2.0);
+
+            // ── BID SIDE: open if under capacity and market is safe ────────────
+            if active_tranches < self.live_max_tranches && safe_to_buy {
+                let aggressive_spread  = spread_delta * 0.8;
+                let base_bid_price     = reservation_price - aggressive_spread;
+                let stepped_bid_price  = base_bid_price - grid_offset;
+                self.open_bid = Some((stepped_bid_price / self.tick_size).round() * self.tick_size);
+            } else {
+                // Max capacity reached OR OBI shield blocking — pull bids.
                 self.open_bid = None;
             }
-            self.open_ask = None;
+
+            // ── ASK SIDE: always quote when holding at least 1 tranche ────────
+            // safe_to_sell at default obi_threshold=1.0 is always true.
+            // Stale Inventory Dump: after 600 ticks (~60s) surrender the profit
+            // floor so AS math can exit at break-even and free frozen capital.
+            if active_tranches > 0 && safe_to_sell {
+                let stale_release    = if self.ticks_held > 600 { 0.0 } else { self.tick_size };
+                let min_profit_price = self.last_fill_price + stale_release;
+                self.open_ask = Some(optimal_ask.max(min_profit_price));
+            } else {
+                self.open_ask = None;
+            }
         }
 
         // ── Panic Stop-Loss ───────────────────────────────────────────────────

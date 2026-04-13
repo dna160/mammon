@@ -46,7 +46,11 @@ struct AgentQParams {
     /// OBI momentum shield [0.0–1.0]. 1.0 = permissive (any OBI), 0.1 = uptrends only.
     /// Optional — older payloads without this field default to 1.0 (fully permissive).
     #[serde(default)]
-    obi_threshold:    Option<f64>,
+    obi_threshold:       Option<f64>,
+    /// Max concurrent $6 tranches [1–10]. Default 1 (strict ping-pong).
+    /// Agent Q scales up during safe regimes to increase fill cadence.
+    #[serde(default)]
+    max_active_tranches: Option<u32>,
     #[allow(dead_code)]
     system_status:    Option<String>,
 }
@@ -948,11 +952,12 @@ async fn stream_loop(
                     if let Some(eng) = engines.get_mut(&sym) {
                         match msg {
                             AgentQMessage::Params(p) => {
-                                let obi = p.obi_threshold.unwrap_or(1.0);
-                                eng.update_params(p.gamma, p.min_spread_ticks, p.tfi_threshold, obi);
+                                let obi       = p.obi_threshold.unwrap_or(1.0);
+                                let tranches  = p.max_active_tranches.unwrap_or(1);
+                                eng.update_params(p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, tranches);
                                 info!(
-                                    "[{}][AgentQ-Tactical] γ={:.2} spread={:.1} tfi={:.0} obi={:.2} status={:?}",
-                                    sym, p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, p.system_status
+                                    "[{}][AgentQ-Tactical] γ={:.2} spread={:.1} tfi={:.0} obi={:.2} tranches={} status={:?}",
+                                    sym, p.gamma, p.min_spread_ticks, p.tfi_threshold, obi, tranches, p.system_status
                                 );
                             }
                             AgentQMessage::Regime(r) => {

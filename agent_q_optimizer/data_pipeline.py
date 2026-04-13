@@ -254,23 +254,21 @@ def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> fl
     """
     RenTech-Style Cadence Reward Function.
 
-    Priority 1: Volume   — target 100 round trips per 1m cycle.
-                           Exponential penalty below 100, logarithmic bonus above.
+    Priority 1: Volume   — target 15 round trips per 1m cycle (multi-tranche cadence).
+                           Exponential penalty below 15, logarithmic bonus above.
     Priority 2: Win Rate — (win_rate - 0.5) * 100  → range [-50, +50]
-    Priority 3: PnL      — Asymmetric: negative PnL × 50 (falling knife penalty),
-                           positive PnL × 10. Forces Agent Q to learn obi_threshold
-                           tuning to avoid adverse selection.
+    Priority 3: PnL      — net_pnl × 10 (linear reinforcement).
 
     Examples (1m cycle):
-       5 trades, 60% WR, +$0.02 PnL  → volume=-81.0 + wr=+10.0 + pnl=+0.2  = -70.8
-      10 trades, 60% WR, +$0.05 PnL  → volume=-64.0 + wr=+10.0 + pnl=+0.5  = -53.5
-      10 trades, 40% WR, -$0.10 PnL  → volume=-64.0 + wr=-10.0 + pnl=-5.0  = -79.0
-     100 trades, 55% WR, +$0.10 PnL  → volume=  0.0 + wr= +5.0 + pnl=+1.0  =  +6.0
+       3 trades, 66% WR, +$0.01 PnL  → volume=-74.0 + wr=+16.0 + pnl=+0.1  = -57.9
+       8 trades, 50% WR, +$0.02 PnL  → volume=-42.4 + wr=  0.0 + pnl=+0.2  = -42.2
+      15 trades, 55% WR, +$0.05 PnL  → volume=  0.0 + wr= +5.0 + pnl=+0.5  =  +5.5
+      30 trades, 60% WR, +$0.10 PnL  → volume= +7.0 + wr=+10.0 + pnl=+1.0  = +18.0
     """
     import math
-    target_trades = 100.0
+    target_trades = 15.0   # Adjusted for 1-minute multi-tranche cycle
 
-    # 1. Volume Score — brutal punishment for < 100 trades
+    # 1. Volume Score — brutal punishment for < 15 trades
     if round_trips < target_trades:
         volume_score = -100.0 * ((1.0 - (round_trips / target_trades)) ** 2)
     else:
@@ -279,12 +277,8 @@ def calculate_rl_reward(round_trips: int, win_rate: float, net_pnl: float) -> fl
     # 2. Win Rate Score — centred on 50%
     win_rate_score = (win_rate - 0.5) * 100.0
 
-    # 3. PnL Score — asymmetric punishment for capital bleed (adverse selection)
-    # Negative PnL punished 5× harder to force obi_threshold learning.
-    if net_pnl < 0:
-        pnl_score = net_pnl * 50.0   # Falling knife penalty
-    else:
-        pnl_score = net_pnl * 10.0   # Positive reinforcement
+    # 3. PnL Score — linear reinforcement
+    pnl_score = net_pnl * 10.0
 
     return volume_score + win_rate_score + pnl_score
 

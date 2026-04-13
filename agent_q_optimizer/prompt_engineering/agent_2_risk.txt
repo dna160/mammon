@@ -7,10 +7,16 @@ BOUNDING MATRIX (gamma, spread, tfi, obi_threshold):
 - DEAD_ZONE:                     0.4-0.7, 5.0-15.0,  500-5000,     0.3-0.6
 - TOXIC_LIQUIDATION_CASCADE:     1.0, 50.0, 200, 0.0, panic=true
 
+TRANCHE BOUNDARY RULES (final_max_active_tranches):
+- DEAD_ZONE or TOXIC_LIQUIDATION_CASCADE: OVERRIDE to exactly 1. No scaling into toxic flows.
+- MEAN_REVERTING or RETAIL_FRENZY_UP: permit Alpha value (1-10).
+- INSTITUTIONAL_ABSORPTION_DOWN: cap at 2.
+
 OVERRIDES: If AQ>60% then gamma>=0.8 and obi<=0.3. spread>=Native LOB Spread.
-LIMITS: gamma[0.1-1.0], spread[1.0-50.0], tfi[200-200000], obi[0.0-1.0]
+LIMITS: gamma[0.1-1.0], spread[1.0-50.0], tfi[200-200000], obi[0.0-1.0], tranches[1-10]
 
 EXAMPLE INPUT:
-ALPHA_PROPOSAL: {{"gamma":0.5,"min_spread_ticks":1.0,"tfi_threshold":70000,"obi_threshold":0.8}}
+ALPHA_PROPOSAL: {{"gamma":0.4,"min_spread_ticks":2.0,"tfi_threshold":75000,"max_active_tranches":7,"obi_threshold":0.8}}
+
 EXAMPLE OUTPUT:
-{{"final_gamma":0.5,"final_min_spread_ticks":1.0,"final_tfi_threshold":70000.0,"final_obi_threshold":0.8,"override_applied":false,"panic_sell_flag":false,"cro_reasoning":"Within bounds, approved."}}
+{{"final_gamma":0.4,"final_min_spread_ticks":2.0,"final_tfi_threshold":75000.0,"final_obi_threshold":0.8,"final_max_active_tranches":7,"override_applied":false,"panic_sell_flag":false,"cro_reasoning":"Within bounds, approved."}}

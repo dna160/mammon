@@ -357,14 +357,15 @@ def tune_parameters_for_symbol(symbol: str) -> None:
         publish_safe_mode(symbol)
         return
 
-    final_gamma  = float(cro_dict.get("final_gamma",            0.8))
-    final_spread = float(cro_dict.get("final_min_spread_ticks", 10.0))
-    final_tfi    = float(cro_dict.get("final_tfi_threshold",    65_000.0))
-    final_obi    = float(cro_dict.get("final_obi_threshold",    1.0))    # 1.0 = permissive default
+    final_gamma    = float(cro_dict.get("final_gamma",               0.8))
+    final_spread   = float(cro_dict.get("final_min_spread_ticks",    10.0))
+    final_tfi      = float(cro_dict.get("final_tfi_threshold",       65_000.0))
+    final_obi      = float(cro_dict.get("final_obi_threshold",       1.0))    # 1.0 = permissive default
+    final_tranches = int(cro_dict.get("final_max_active_tranches",   1))       # 1 = strict ping-pong default
 
     log.info(
-        "[%s] Agent-2: \u03b3=%.2f spread=%.1f tfi=$%.0f obi=%.2f override=%s",
-        symbol, final_gamma, final_spread, final_tfi, final_obi, override_applied,
+        "[%s] Agent-2: \u03b3=%.2f spread=%.1f tfi=$%.0f obi=%.2f tranches=%d override=%s",
+        symbol, final_gamma, final_spread, final_tfi, final_obi, final_tranches, override_applied,
     )
 
     # Step 5: [V2] Log decision to agent_q_memory BEFORE publishing

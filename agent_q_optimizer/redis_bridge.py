@@ -66,11 +66,12 @@ def publish_params(symbol: str, cro_output: dict) -> None:
     """
     channel = f"hft:live_params:{symbol.lower()}"
     payload = {
-        "gamma":            float(cro_output.get("final_gamma",            0.8)),
-        "min_spread_ticks": float(cro_output.get("final_min_spread_ticks", 10.0)),
-        "tfi_threshold":    float(cro_output.get("final_tfi_threshold",    65_000.0)),
-        "obi_threshold":    float(cro_output.get("final_obi_threshold",    1.0)),
-        "system_status":    "LIVE",
+        "gamma":               float(cro_output.get("final_gamma",               0.8)),
+        "min_spread_ticks":    float(cro_output.get("final_min_spread_ticks",    10.0)),
+        "tfi_threshold":       float(cro_output.get("final_tfi_threshold",       65_000.0)),
+        "obi_threshold":       float(cro_output.get("final_obi_threshold",       1.0)),
+        "max_active_tranches": int(cro_output.get("final_max_active_tranches",   1)),
+        "system_status":       "LIVE",
     }
     r = _get_redis()
     r.publish(channel, json.dumps(payload))
@@ -87,11 +88,12 @@ def publish_safe_mode(symbol: str) -> None:
     """
     channel = f"hft:live_params:{symbol.lower()}"
     payload = {
-        "gamma":            0.9,
-        "min_spread_ticks": 20.0,
-        "tfi_threshold":    0.1,
-        "obi_threshold":    0.3,   # Conservative in safe mode — only buy during uptrends
-        "system_status":    "SAFE_MODE_LOCKDOWN",
+        "gamma":               0.9,
+        "min_spread_ticks":    20.0,
+        "tfi_threshold":       0.1,
+        "obi_threshold":       0.3,   # Conservative in safe mode — only buy during uptrends
+        "max_active_tranches": 1,     # Safe mode: strict ping-pong only
+        "system_status":       "SAFE_MODE_LOCKDOWN",
     }
     r = _get_redis()
     r.publish(channel, json.dumps(payload))
