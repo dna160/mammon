@@ -1,0 +1,8 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+openai>=1.30.0           # LM Studio OpenAI-compatible client
+redis>=5.0.0             # Redis async + sync client
+psycopg2-binary>=2.9.9   # PostgreSQL driver
+python-dotenv>=1.0.0     # .env loader
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil>=2.9.0   # Timestamp utilities
